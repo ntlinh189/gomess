@@ -1,0 +1,2 @@
+# gomess
+learning golang
