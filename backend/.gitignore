@@ -1,0 +1,9 @@
+*.exe
+*.out
+*.app
+
+bin/
+dist/
+build/
+
+.env
