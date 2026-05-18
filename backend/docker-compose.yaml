@@ -4,7 +4,6 @@ services:
   mysql:
     image: mysql:8.0
     container_name: gomess-mysql
-    restart: always
 
     environment:
       MYSQL_ROOT_PASSWORD: root
@@ -15,8 +14,9 @@ services:
     ports:
       - "3306:3306"
 
-    volumes:
-      - mysql_data:/var/lib/mysql
+  redis:
+    image: redis:7
+    container_name: gomess-redis
 
-volumes:
-  mysql_data:
+    ports:
+      - "6379:6379"

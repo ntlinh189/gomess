@@ -1,26 +1,55 @@
 package config
 
-import "os"
+import (
+	"os"
 
-type Config struct {
-	Port           string
-	DBUrl          string
-	JWTSecret      string
-	GoogleClientID string
+	"github.com/joho/godotenv"
+)
+
+type ConfigInterface interface {
+	GetPort() string
+	GetDBUrl() string
+	GetGoogleClientID() string
+	GetJWTSecret() string
+	GetRedisAddr() string
 }
 
-func Load() *Config {
+type Config struct {
+	port           string
+	dbUrl          string
+	jwtSecret      string
+	googleClientID string
+	redisAddr      string
+}
+
+func NewConfig() *Config {
+	godotenv.Load()
+
 	return &Config{
-		Port:           getEnv("PORT", "8080"),
-		DBUrl:          os.Getenv("DB_URL"),
-		JWTSecret:      os.Getenv("JWT_SECRET"),
-		GoogleClientID: os.Getenv("GOOGLE_CLIENT_ID"),
+		port:           os.Getenv("PORT"),
+		dbUrl:          os.Getenv("DB_URL"),
+		jwtSecret:      os.Getenv("JWT_SECRET"),
+		googleClientID: os.Getenv("GOOGLE_CLIENT_ID"),
+		redisAddr:      os.Getenv("REDIS_ADDR"),
 	}
 }
 
-func getEnv(key, fallback string) string {
-    if v := os.Getenv(key); v != "" {
-        return v
-    }
-    return fallback
+func (c *Config) GetPort() string {
+	return c.port
+}
+
+func (c *Config) GetDBUrl() string {
+	return c.dbUrl
+}
+
+func (c *Config) GetGoogleClientID() string {
+	return c.googleClientID
+}
+
+func (c *Config) GetJWTSecret() string {
+	return c.jwtSecret
+}
+
+func (c *Config) GetRedisAddr() string {
+	return c.redisAddr
 }

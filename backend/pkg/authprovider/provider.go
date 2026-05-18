@@ -7,6 +7,6 @@ type UserInfo struct {
 	Avatar string
 }
 
-type Provider interface {
+type ProviderInterface interface {
 	Verify(token string) (*UserInfo, error)
 }
