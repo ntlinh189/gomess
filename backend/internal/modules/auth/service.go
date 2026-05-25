@@ -15,7 +15,9 @@ import (
 )
 
 type ServiceInterface interface {
-	Login(providerName, token string) (*dto.LoginResponse, error)
+	Login(providerName, token string) (*dto.LoginResponse, string, error)
+	Refresh(refreshToken string) (*dto.RefreshResponse, error)
+	Logout(refreshToken string) error
 }
 
 type Service struct {
@@ -36,20 +38,20 @@ func NewService(repo RepositoryInterface, jwt jwt.JWTInterface, cfg config.Confi
 	}
 }
 
-func (s *Service) Login(providerName, token string) (*dto.LoginResponse, error) {
+func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string, error) {
 	provider, ok := s.providers[providerName]
 	if !ok {
-		return nil, errors.New("Unsupported provider")
+		return nil, "", errors.New("Unsupported provider")
 	}
 
 	info, err := provider.Verify(token)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	u, err := s.repo.FindByProvider(providerName, info.ID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if u == nil {
@@ -61,18 +63,18 @@ func (s *Service) Login(providerName, token string) (*dto.LoginResponse, error) 
 			Avatar:     info.Avatar,
 		}
 		if err := s.repo.Create(u); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
 
 	accessToken, err := s.jwt.GenerateAccessToken(u.ID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	refreshToken, err := utils.GenerateToken(32)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	err = s.redis.Set(
@@ -83,11 +85,41 @@ func (s *Service) Login(providerName, token string) (*dto.LoginResponse, error) 
 	)
 
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	return &dto.LoginResponse{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
+		AccessToken: accessToken,
+	}, refreshToken, nil
+}
+
+func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, error) {
+	userID, err := s.redis.Get(
+		context.Background(),
+		"refresh:"+utils.SHA256(refreshToken),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := strconv.ParseInt(userID, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	accessToken, err := s.jwt.GenerateAccessToken(id)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dto.RefreshResponse{
+		AccessToken: accessToken,
 	}, nil
+}
+
+func (s *Service) Logout(refreshToken string) error {
+	return s.redis.Delete(
+		context.Background(),
+		"refresh:"+utils.SHA256(refreshToken),
+	)
 }
