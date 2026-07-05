@@ -11,7 +11,7 @@ import (
 
 type Module struct {
 	handler HandlerInterface
-	jwt jwt.JWTInterface
+	jwt     jwt.JWTInterface
 }
 
 func NewModule(ctx *modules.ModuleContext) *Module {
@@ -27,4 +27,5 @@ func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
 
 	user.GET("ping", func(c *gin.Context) { c.JSON(http.StatusOK, "pong") })
 	user.GET("/me", middleware.Auth(m.jwt), m.handler.GetMe)
+	user.GET("/search", m.handler.Search)
 }

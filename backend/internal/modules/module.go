@@ -14,8 +14,8 @@ type ModuleInterface interface {
 }
 
 type ModuleContext struct {
-	DB database.DatabaseInterface
-	JWT jwt.JWTInterface
-	Cfg config.ConfigInterface
+	DB    database.DatabaseInterface
+	JWT   jwt.JWTInterface
+	Cfg   config.ConfigInterface
 	Redis redis.RedisInterface
 }

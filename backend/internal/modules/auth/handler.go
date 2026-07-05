@@ -17,13 +17,28 @@ type HandlerInterface interface {
 
 type Handler struct {
 	service ServiceInterface
-	cfg config.ConfigInterface
+	cfg     config.ConfigInterface
 }
 
 func NewHandler(service ServiceInterface, cfg config.ConfigInterface) *Handler {
-	return &Handler{service: service, cfg: cfg,}
+	return &Handler{service: service, cfg: cfg}
 }
 
+// Login godoc
+//
+//	@Summary		Login with OAuth
+//	@Description	Login or register user using OAuth provider
+//	@Tags			Authentication
+//
+//	@Accept			json
+//	@Produce		json
+//
+//	@Param			provider	path		string				true	"OAuth provider"
+//	@Param			request		body		dto.LoginRequest	true	"Login request"
+//
+//	@Success		200			{object}	dto.LoginResponse
+//
+//	@Router			/auth/login [post]
 func (h *Handler) Login(c *gin.Context) {
 	provider := c.Param("provider")
 
@@ -51,7 +66,7 @@ func (h *Handler) Login(c *gin.Context) {
 	c.SetCookie(
 		"refresh_token",
 		refreshToken,
-		int((30*24*time.Hour).Seconds()),
+		int((30 * 24 * time.Hour).Seconds()),
 		"/",
 		"",
 		h.cfg.IsProduction(),
@@ -61,6 +76,17 @@ func (h *Handler) Login(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+// Refresh godoc
+//
+//	@Summary		Refresh access token
+//	@Description	Generate a new access token using refresh token stored in cookie
+//	@Tags			Authentication
+//
+//	@Produce		json
+//
+//	@Success		200	{object}	dto.RefreshResponse
+//
+//	@Router			/auth/refresh [post]
 func (h *Handler) Refresh(c *gin.Context) {
 	refreshToken, err := c.Cookie("refresh_token")
 
@@ -79,6 +105,17 @@ func (h *Handler) Refresh(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+// Logout godoc
+//
+//	@Summary		Logout
+//	@Description	Logout current user and invalidate refresh token
+//	@Tags			Authentication
+//
+//	@Produce		json
+//
+//	@Security		BearerAuth
+//
+//	@Router			/auth/logout [post]
 func (h *Handler) Logout(c *gin.Context) {
 	refreshToken, err := c.Cookie("refresh_token")
 
@@ -103,5 +140,5 @@ func (h *Handler) Logout(c *gin.Context) {
 		true,
 	)
 
-	c.JSON(http.StatusOK, gin.H{"message": "logged out",})
+	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }

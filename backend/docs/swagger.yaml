@@ -1,0 +1,159 @@
+definitions:
+  dto.GetMeResponse:
+    properties:
+      avatar:
+        type: string
+      email:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+    type: object
+  dto.LoginRequest:
+    properties:
+      token:
+        type: string
+    required:
+    - token
+    type: object
+  dto.LoginResponse:
+    properties:
+      access_token:
+        type: string
+    type: object
+  dto.RefreshResponse:
+    properties:
+      access_token:
+        type: string
+    type: object
+  dto.SearchResponse:
+    properties:
+      avatar:
+        type: string
+      email:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      provider:
+        type: string
+    type: object
+info:
+  contact: {}
+  description: Backend API for GoMess
+  title: GoMess API
+  version: "1.0"
+paths:
+  /auth/login:
+    post:
+      consumes:
+      - application/json
+      description: Login or register user using OAuth provider
+      parameters:
+      - description: OAuth provider
+        in: path
+        name: provider
+        required: true
+        type: string
+      - description: Login request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.LoginResponse'
+      summary: Login with OAuth
+      tags:
+      - Authentication
+  /auth/logout:
+    post:
+      description: Logout current user and invalidate refresh token
+      produces:
+      - application/json
+      responses: {}
+      security:
+      - BearerAuth: []
+      summary: Logout
+      tags:
+      - Authentication
+  /auth/refresh:
+    post:
+      description: Generate a new access token using refresh token stored in cookie
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.RefreshResponse'
+      summary: Refresh access token
+      tags:
+      - Authentication
+  /user/me:
+    get:
+      description: Get information of authenticated user
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.GetMeResponse'
+      security:
+      - BearerAuth: []
+      summary: Get current user
+      tags:
+      - User
+  /user/search:
+    get:
+      description: Search users by provider and keyword
+      parameters:
+      - description: Provider
+        in: query
+        name: provider
+        required: true
+        type: string
+      - description: Search keyword
+        in: query
+        name: keyword
+        required: true
+        type: string
+      - description: Skip
+        in: query
+        name: skip
+        type: integer
+      - description: Limit
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.SearchResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Search users
+      tags:
+      - User
+securityDefinitions:
+  BearerAuth:
+    description: |-
+      Type "Bearer" followed by a space and JWT token.
+      Example: Bearer eyJhbGciOiJIUzI1NiIs...
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

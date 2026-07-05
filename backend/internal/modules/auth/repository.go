@@ -39,7 +39,7 @@ func (r *Repository) FindByProvider(provider, providerID string) (*models.User, 
 		&user.Name,
 		&user.Avatar,
 	)
-	
+
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

@@ -18,6 +18,8 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
 )
 
 type Application struct {
@@ -27,6 +29,8 @@ type Application struct {
 
 func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 	r := gin.Default()
+
+	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	r.Use(cors.New(cors.Config{
 		AllowOrigins: []string{
@@ -46,7 +50,7 @@ func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 			"Authorization",
 		},
 		AllowCredentials: cfg.AllowCredentials(),
-		MaxAge: 12 * time.Hour,
+		MaxAge:           12 * time.Hour,
 	}))
 
 	db, err := database.NewMySql(cfg)
@@ -59,9 +63,9 @@ func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 	redis := redis.NewRedis(cfg.GetRedisAddr())
 
 	ctx := &modules.ModuleContext{
-		DB:  db,
-		JWT: jwt,
-		Cfg: cfg,
+		DB:    db,
+		JWT:   jwt,
+		Cfg:   cfg,
 		Redis: redis,
 	}
 
@@ -84,11 +88,11 @@ func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 
 func (a *Application) Run() error {
 	srv := &http.Server{
-		Addr: a.config.GetPort(),
+		Addr:    a.config.GetPort(),
 		Handler: a.router,
 	}
 
-	go func () {
+	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 			return
