@@ -1,10 +1,11 @@
 package user
 
 import (
+	"gomess/internal/middleware"
 	"gomess/internal/modules"
-	"gomess/internal/modules/middleware"
+	"gomess/internal/redis"
 	"gomess/pkg/jwt"
-	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -12,20 +13,26 @@ import (
 type Module struct {
 	handler HandlerInterface
 	jwt     jwt.JWTInterface
+	redis   redis.RedisInterface
 }
 
-func NewModule(ctx *modules.ModuleContext) *Module {
+func NewModule(ctx *modules.ModuleContext, repo RepositoryInterface) *Module {
+	handler := NewHandler(NewService(repo), ctx.Cfg)
 
-	handler := NewHandler(NewService(NewRepository(ctx.DB)))
-	jwt := ctx.JWT
-
-	return &Module{handler: handler, jwt: jwt}
+	return &Module{handler: handler, jwt: ctx.JWT, redis: ctx.Redis}
 }
 
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
 	user := rg.Group("/user")
 
-	user.GET("ping", func(c *gin.Context) { c.JSON(http.StatusOK, "pong") })
-	user.GET("/me", middleware.Auth(m.jwt), m.handler.GetMe)
-	user.GET("/search", m.handler.Search)
+	protected := user.Group("/")
+	protected.Use(middleware.Auth(m.jwt))
+
+	protected.GET("/me", m.handler.GetMe)
+	protected.GET(
+		"/search", 
+		middleware.RateLimit(m.redis, "search", 30, time.Minute, middleware.RateLimitByUser),
+		m.handler.Search,
+	)
+	protected.DELETE("/me", m.handler.DeleteMe)
 }

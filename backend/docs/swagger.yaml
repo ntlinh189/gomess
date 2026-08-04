@@ -1,9 +1,67 @@
 definitions:
-  dto.GetMeResponse:
+  dto.AttachmentInput:
     properties:
+      file_name:
+        type: string
+      object_key:
+        type: string
+    required:
+    - file_name
+    - object_key
+    type: object
+  dto.AttachmentResponse:
+    properties:
+      file_name:
+        type: string
+      id:
+        type: integer
+      mime_type:
+        type: string
+      size_bytes:
+        type: integer
+      type:
+        type: string
+      url:
+        type: string
+    type: object
+  dto.DeleteMeRequest:
+    properties:
+      confirm:
+        type: boolean
+    required:
+    - confirm
+    type: object
+  dto.FriendRequestResponse:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: integer
+      receiver_id:
+        type: integer
+      sender_id:
+        type: integer
+      status:
+        type: string
+    type: object
+  dto.FriendResponse:
+    properties:
+      account:
+        type: string
       avatar:
         type: string
-      email:
+      id:
+        type: integer
+      name:
+        type: string
+      provider:
+        type: string
+    type: object
+  dto.GetMeResponse:
+    properties:
+      account:
+        type: string
+      avatar:
         type: string
       id:
         type: integer
@@ -22,6 +80,39 @@ definitions:
       access_token:
         type: string
     type: object
+  dto.MessageResponse:
+    properties:
+      attachments:
+        items:
+          $ref: '#/definitions/dto.AttachmentResponse'
+        type: array
+      content:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: integer
+      receiver_id:
+        type: integer
+      revoked:
+        type: boolean
+      sender_id:
+        type: integer
+    type: object
+  dto.PresignRequest:
+    properties:
+      file_name:
+        type: string
+    required:
+    - file_name
+    type: object
+  dto.PresignResponse:
+    properties:
+      object_key:
+        type: string
+      upload_url:
+        type: string
+    type: object
   dto.RefreshResponse:
     properties:
       access_token:
@@ -29,9 +120,9 @@ definitions:
     type: object
   dto.SearchResponse:
     properties:
-      avatar:
+      account:
         type: string
-      email:
+      avatar:
         type: string
       id:
         type: integer
@@ -39,6 +130,28 @@ definitions:
         type: string
       provider:
         type: string
+    type: object
+  dto.SendMessageRequest:
+    properties:
+      attachments:
+        items:
+          $ref: '#/definitions/dto.AttachmentInput'
+        maxItems: 10
+        type: array
+      content:
+        maxLength: 2000
+        type: string
+      receiver_id:
+        type: integer
+    required:
+    - receiver_id
+    type: object
+  dto.SendRequestRequest:
+    properties:
+      receiver_id:
+        type: integer
+    required:
+    - receiver_id
     type: object
 info:
   contact: {}
@@ -97,7 +210,268 @@ paths:
       summary: Refresh access token
       tags:
       - Authentication
+  /friends:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.FriendResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get friend list
+      tags:
+      - Friend
+  /friends/{id}:
+    delete:
+      parameters:
+      - description: Friend user ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Unfriend
+      tags:
+      - Friend
+  /friends/requests:
+    post:
+      consumes:
+      - application/json
+      description: Send a friend request to another user (auto-accepts if that user
+        already sent one to you)
+      parameters:
+      - description: Receiver
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.SendRequestRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+      security:
+      - BearerAuth: []
+      summary: Send friend request
+      tags:
+      - Friend
+  /friends/requests/{id}/accept:
+    post:
+      parameters:
+      - description: Friend request ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Accept friend request
+      tags:
+      - Friend
+  /friends/requests/{id}/reject:
+    post:
+      parameters:
+      - description: Friend request ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Reject friend request
+      tags:
+      - Friend
+  /friends/requests/received:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.FriendRequestResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get received friend requests
+      tags:
+      - Friend
+  /friends/requests/sent:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.FriendRequestResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get sent friend requests
+      tags:
+      - Friend
+  /messages:
+    post:
+      consumes:
+      - application/json
+      description: Send a message to a friend (only friends can message each other)
+      parameters:
+      - description: Message
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.SendMessageRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.MessageResponse'
+      security:
+      - BearerAuth: []
+      summary: Send a message
+      tags:
+      - Message
+  /messages/{friendId}:
+    get:
+      parameters:
+      - description: Friend user ID
+        in: path
+        name: friendId
+        required: true
+        type: integer
+      - description: Get messages older than this ID
+        in: query
+        name: before_id
+        type: integer
+      - description: Limit (default 20, max 100)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.MessageResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get message history with a friend
+      tags:
+      - Message
+  /messages/{id}:
+    delete:
+      parameters:
+      - description: Message ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Delete a message for myself only
+      tags:
+      - Message
+  /messages/{id}/revoke:
+    post:
+      parameters:
+      - description: Message ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Revoke a message for everyone
+      tags:
+      - Message
+  /uploads/presign:
+    post:
+      consumes:
+      - application/json
+      description: Get a short-lived URL to upload a file directly to object storage
+      parameters:
+      - description: File info
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.PresignRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.PresignResponse'
+      security:
+      - BearerAuth: []
+      summary: Get presigned upload URL
+      tags:
+      - Upload
   /user/me:
+    delete:
+      consumes:
+      - application/json
+      description: Permanently delete the authenticated user's account and all related
+        data (friends, messages, attachment metadata)
+      parameters:
+      - description: Confirmation
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.DeleteMeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Delete my account
+      tags:
+      - User
     get:
       description: Get information of authenticated user
       produces:

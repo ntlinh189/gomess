@@ -16,7 +16,7 @@ import (
 
 type ServiceInterface interface {
 	Login(providerName, token string) (*dto.LoginResponse, string, error)
-	Refresh(refreshToken string) (*dto.RefreshResponse, error)
+	Refresh(refreshToken string) (*dto.RefreshResponse, string, error)
 	Logout(refreshToken string) error
 }
 
@@ -32,6 +32,7 @@ func NewService(repo RepositoryInterface, jwt jwt.JWTInterface, cfg config.Confi
 		repo: repo,
 		providers: map[string]authprovider.ProviderInterface{
 			"google": authprovider.NewGoogleProvider(cfg.GetGoogleClientID()),
+			"facebook": authprovider.NewFacebookProvider(cfg.GetFacebookAppID(), cfg.GetFacebookAppSecret()),
 		},
 		jwt:   jwt,
 		redis: redis,
@@ -41,7 +42,7 @@ func NewService(repo RepositoryInterface, jwt jwt.JWTInterface, cfg config.Confi
 func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string, error) {
 	provider, ok := s.providers[providerName]
 	if !ok {
-		return nil, "", errors.New("Unsupported provider")
+		return nil, "", ErrUnsupportedProvider
 	}
 
 	info, err := provider.Verify(token)
@@ -58,7 +59,7 @@ func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string,
 		u = &models.User{
 			Provider:   providerName,
 			ProviderID: info.ID,
-			Email:      info.Email,
+			Account:    info.Account,
 			Name:       info.Name,
 			Avatar:     info.Avatar,
 		}
@@ -72,18 +73,7 @@ func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string,
 		return nil, "", err
 	}
 
-	refreshToken, err := utils.GenerateToken(32)
-	if err != nil {
-		return nil, "", err
-	}
-
-	err = s.redis.Set(
-		context.Background(),
-		"refresh:"+utils.SHA256(refreshToken),
-		strconv.FormatInt(u.ID, 10),
-		30*24*time.Hour,
-	)
-
+	refreshToken, err := s.issueRefreshToken(u.ID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -93,28 +83,36 @@ func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string,
 	}, refreshToken, nil
 }
 
-func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, error) {
-	userID, err := s.redis.Get(
+func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, string, error){
+	userID, err := s.redis.GetDel(
 		context.Background(),
 		"refresh:"+utils.SHA256(refreshToken),
 	)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, redis.ErrNotFound) {
+			return nil, "", ErrInvalidRefreshToken
+		}
+		return nil, "", err
 	}
 
 	id, err := strconv.ParseInt(userID, 10, 64)
 	if err != nil {
-		return nil, err
+		return nil, "", ErrInvalidRefreshToken
 	}
 
 	accessToken, err := s.jwt.GenerateAccessToken(id)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+
+	newRefreshToken, err := s.issueRefreshToken(id)
+	if err != nil {
+		return nil, "", err
 	}
 
 	return &dto.RefreshResponse{
 		AccessToken: accessToken,
-	}, nil
+	}, newRefreshToken, nil
 }
 
 func (s *Service) Logout(refreshToken string) error {
@@ -122,4 +120,23 @@ func (s *Service) Logout(refreshToken string) error {
 		context.Background(),
 		"refresh:"+utils.SHA256(refreshToken),
 	)
+}
+
+func (s *Service) issueRefreshToken(userID int64) (string, error) {
+	refreshToken, err := s.jwt.GenerateRefreshToken()
+	if err != nil {
+		return "", err
+	}
+
+	err = s.redis.Set(
+		context.Background(),
+		"refresh:"+utils.SHA256(refreshToken),
+		strconv.FormatInt(userID, 10),
+		30 * 24 * time.Hour,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return refreshToken, nil
 }

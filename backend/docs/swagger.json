@@ -86,6 +86,399 @@
                 }
             }
         },
+        "/friends": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get friend list",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Send a friend request to another user (auto-accepts if that user already sent one to you)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Send friend request",
+                "parameters": [
+                    {
+                        "description": "Receiver",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.SendRequestRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created"
+                    }
+                }
+            }
+        },
+        "/friends/requests/received": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get received friend requests",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendRequestResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests/sent": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get sent friend requests",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendRequestResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests/{id}/accept": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Accept friend request",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend request ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/friends/requests/{id}/reject": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Reject friend request",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend request ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/friends/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Unfriend",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend user ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/messages": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Send a message to a friend (only friends can message each other)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Send a message",
+                "parameters": [
+                    {
+                        "description": "Message",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.SendMessageRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/dto.MessageResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/messages/{friendId}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Get message history with a friend",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend user ID",
+                        "name": "friendId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Get messages older than this ID",
+                        "name": "before_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Limit (default 20, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.MessageResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/messages/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Delete a message for myself only",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Message ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/messages/{id}/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Revoke a message for everyone",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Message ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/uploads/presign": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Get a short-lived URL to upload a file directly to object storage",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Upload"
+                ],
+                "summary": "Get presigned upload URL",
+                "parameters": [
+                    {
+                        "description": "File info",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.PresignRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.PresignResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/user/me": {
             "get": {
                 "security": [
@@ -107,6 +500,40 @@
                         "schema": {
                             "$ref": "#/definitions/dto.GetMeResponse"
                         }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Permanently delete the authenticated user's account and all related data (friends, messages, attachment metadata)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "Delete my account",
+                "parameters": [
+                    {
+                        "description": "Confirmation",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.DeleteMeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
                     }
                 }
             }
@@ -169,13 +596,102 @@
         }
     },
     "definitions": {
-        "dto.GetMeResponse": {
+        "dto.AttachmentInput": {
+            "type": "object",
+            "required": [
+                "file_name",
+                "object_key"
+            ],
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                },
+                "object_key": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.AttachmentResponse": {
             "type": "object",
             "properties": {
+                "file_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "mime_type": {
+                    "type": "string"
+                },
+                "size_bytes": {
+                    "type": "integer"
+                },
+                "type": {
+                    "type": "string"
+                },
+                "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.DeleteMeRequest": {
+            "type": "object",
+            "required": [
+                "confirm"
+            ],
+            "properties": {
+                "confirm": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "dto.FriendRequestResponse": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "receiver_id": {
+                    "type": "integer"
+                },
+                "sender_id": {
+                    "type": "integer"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.FriendResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
                 "avatar": {
                     "type": "string"
                 },
-                "email": {
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.GetMeResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
+                "avatar": {
                     "type": "string"
                 },
                 "id": {
@@ -205,6 +721,57 @@
                 }
             }
         },
+        "dto.MessageResponse": {
+            "type": "object",
+            "properties": {
+                "attachments": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/dto.AttachmentResponse"
+                    }
+                },
+                "content": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "receiver_id": {
+                    "type": "integer"
+                },
+                "revoked": {
+                    "type": "boolean"
+                },
+                "sender_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "dto.PresignRequest": {
+            "type": "object",
+            "required": [
+                "file_name"
+            ],
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.PresignResponse": {
+            "type": "object",
+            "properties": {
+                "object_key": {
+                    "type": "string"
+                },
+                "upload_url": {
+                    "type": "string"
+                }
+            }
+        },
         "dto.RefreshResponse": {
             "type": "object",
             "properties": {
@@ -216,10 +783,10 @@
         "dto.SearchResponse": {
             "type": "object",
             "properties": {
-                "avatar": {
+                "account": {
                     "type": "string"
                 },
-                "email": {
+                "avatar": {
                     "type": "string"
                 },
                 "id": {
@@ -230,6 +797,39 @@
                 },
                 "provider": {
                     "type": "string"
+                }
+            }
+        },
+        "dto.SendMessageRequest": {
+            "type": "object",
+            "required": [
+                "receiver_id"
+            ],
+            "properties": {
+                "attachments": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "$ref": "#/definitions/dto.AttachmentInput"
+                    }
+                },
+                "content": {
+                    "type": "string",
+                    "maxLength": 2000
+                },
+                "receiver_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "dto.SendRequestRequest": {
+            "type": "object",
+            "required": [
+                "receiver_id"
+            ],
+            "properties": {
+                "receiver_id": {
+                    "type": "integer"
                 }
             }
         }

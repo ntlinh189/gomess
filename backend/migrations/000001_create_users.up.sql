@@ -3,7 +3,7 @@ CREATE TABLE users (
     provider VARCHAR(50) NOT NULL,
     provider_id VARCHAR(255) NOT NULL,
 
-    email VARCHAR(255) NOT NULL,
+    account VARCHAR(255),
     name VARCHAR(255),
     avatar TEXT,
 
@@ -13,9 +13,5 @@ CREATE TABLE users (
     UNIQUE KEY uk_provider_provider_id (
         provider,
         provider_id
-    ),
-
-    UNIQUE KEY uk_email (
-        email
     )
 );

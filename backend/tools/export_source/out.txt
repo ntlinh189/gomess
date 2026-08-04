@@ -1,0 +1,6825 @@
+cmd/api/main.go
+// @title						GoMess API
+// @version					1.0
+// @description				Backend API for GoMess
+//
+// @securityDefinitions.apikey	BearerAuth
+// @in							header
+// @name						Authorization
+// @description				Type "Bearer" followed by a space and JWT token.
+// @description				Example: Bearer eyJhbGciOiJIUzI1NiIs...
+package main
+
+import (
+	_ "gomess/docs"
+	"gomess/internal/app"
+	"gomess/internal/config"
+	"log"
+)
+
+func main() {
+	cfg := config.NewConfig()
+
+	application, err := app.NewApplication(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := application.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+====================================================================================================
+
+cmd/migrate/main.go
+package main
+
+import (
+	"errors"
+	"flag"
+	"gomess/internal/config"
+	"gomess/internal/database"
+	"log"
+
+	"github.com/golang-migrate/migrate/v4"
+	mysqlmigrate "github.com/golang-migrate/migrate/v4/database/mysql"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+)
+
+func main() {
+	direction := flag.String("direction", "up", `"up" or "down"`)
+	flag.Parse()
+
+	cfg := config.NewConfig()
+
+	db, err := database.NewMySql(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	driver, err := mysqlmigrate.WithInstance(db.GetDB(), &mysqlmigrate.Config{})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	m, err := migrate.NewWithDatabaseInstance("file://migrations", "mysql", driver)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	switch *direction {
+	case "up":
+		err = m.Up()
+	case "down":
+		err = m.Down()
+	default:
+		log.Fatalf("unknown direction: %s", *direction)
+	}
+
+	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		log.Fatal(err)
+	}
+
+	log.Println("migration completed:", *direction)
+}
+
+====================================================================================================
+
+cmd/worker/main.go
+package main
+
+import (
+	"context"
+	"gomess/internal/config"
+	"gomess/internal/database"
+	"gomess/internal/logger"
+	"gomess/internal/modules/message"
+	"gomess/pkg/storage"
+	"log/slog"
+	"os"
+	"time"
+)
+
+const gracePeriod = 24 * time.Hour
+
+func main() {
+	cfg := config.NewConfig()
+	log := logger.New(cfg.IsProduction())
+
+	db, err := database.NewMySql(cfg)
+	if err != nil {
+		log.Error("worker: failed to connect database", "error", err)
+		os.Exit(1)
+	}
+
+	storageClient, err := storage.NewStorage(
+		cfg.GetMinioEndpoint(),
+		cfg.GetMinioAccessKey(),
+		cfg.GetMinioSecretKey(),
+		cfg.GetMinioBucket(),
+		cfg.MinioUseSSL(),
+	)
+	if err != nil {
+		log.Error("worker: failed to connect storage", "error", err)
+		os.Exit(1)
+	}
+
+	messageRepo := message.NewRepository(db)
+
+	interval := time.Duration(cfg.WorkerCleanupIntervalHours()) * time.Hour
+	log.Info("worker started", "cleanup_interval", interval.String())
+
+	for {
+		cleanupOrphanedAttachments(context.Background(), log, messageRepo, storageClient)
+		time.Sleep(interval)
+	}
+}
+
+func cleanupOrphanedAttachments(
+	ctx context.Context,
+	log *slog.Logger,
+	repo message.RepositoryInterface,
+	s storage.StorageInterface,
+) {
+	log.Info("cleanup job started")
+
+	referenced, err := repo.GetAllObjectKeys()
+	if err != nil {
+		log.Error("cleanup: failed to list referenced object keys", "error", err)
+		return
+	}
+
+	referencedSet := make(map[string]struct{}, len(referenced))
+	for _, key := range referenced {
+		referencedSet[key] = struct{}{}
+	}
+
+	stored, err := s.ListObjects(ctx, "attachments/")
+	if err != nil {
+		log.Error("cleanup: failed to list storage objects", "error", err)
+		return
+	}
+
+	deleted := 0
+	for _, obj := range stored {
+		if _, ok := referencedSet[obj.Key]; ok {
+			continue
+		}
+
+		if time.Since(obj.LastModified) < gracePeriod {
+			continue
+		}
+
+		if err := s.DeleteObject(ctx, obj.Key); err != nil {
+			log.Error("cleanup: failed to delete orphaned object", "object_key", obj.Key, "error", err)
+			continue
+		}
+
+		deleted++
+	}
+
+	log.Info("cleanup job finished", "checked", len(stored), "deleted", deleted)
+}
+
+====================================================================================================
+
+docker-compose.yaml
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: gomess-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: gomess
+      MYSQL_USER: gomess
+      MYSQL_PASSWORD: 123456
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: gomess-redis
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: gomess-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: gomess
+      MINIO_ROOT_PASSWORD: gomess12345
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console web
+    volumes:
+      - minio-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: gomess-api
+    env_file:
+      - .env
+    environment:
+      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      REDIS_ADDR: "redis:6379"
+      MINIO_ENDPOINT: "minio:9000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    container_name: gomess-worker
+    env_file:
+      - .env
+    environment:
+      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      MINIO_ENDPOINT: "minio:9000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  minio-data:
+
+====================================================================================================
+
+Dockerfile
+# ---- Build stage ----
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /gomess-api ./cmd/api
+RUN CGO_ENABLED=0 GOOS=linux go build -o /gomess-worker ./cmd/worker
+
+# ---- Runtime stage ----
+FROM alpine:3.20 AS api
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+
+COPY --from=builder /gomess-api .
+RUN adduser -D -u 1000 appuser
+USER appuser
+EXPOSE 8080
+ENTRYPOINT ["./gomess-api"]
+
+# ---- Runtime: Worker ----
+FROM alpine:3.20 AS worker
+
+RUN apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=builder /gomess-worker .
+RUN adduser -D -u 1000 appuser
+USER appuser
+ENTRYPOINT ["./gomess-worker"]
+
+====================================================================================================
+
+docs/docs.go
+// Package docs Code generated by swaggo/swag. DO NOT EDIT
+package docs
+
+import "github.com/swaggo/swag"
+
+const docTemplate = `{
+    "schemes": {{ marshal .Schemes }},
+    "swagger": "2.0",
+    "info": {
+        "description": "{{escape .Description}}",
+        "title": "{{.Title}}",
+        "contact": {},
+        "version": "{{.Version}}"
+    },
+    "host": "{{.Host}}",
+    "basePath": "{{.BasePath}}",
+    "paths": {
+        "/auth/login": {
+            "post": {
+                "description": "Login or register user using OAuth provider",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Authentication"
+                ],
+                "summary": "Login with OAuth",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "OAuth provider",
+                        "name": "provider",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Login request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.LoginRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.LoginResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/logout": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Logout current user and invalidate refresh token",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Authentication"
+                ],
+                "summary": "Logout",
+                "responses": {}
+            }
+        },
+        "/auth/refresh": {
+            "post": {
+                "description": "Generate a new access token using refresh token stored in cookie",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Authentication"
+                ],
+                "summary": "Refresh access token",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.RefreshResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/friends": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get friend list",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Send a friend request to another user (auto-accepts if that user already sent one to you)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Send friend request",
+                "parameters": [
+                    {
+                        "description": "Receiver",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.SendRequestRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created"
+                    }
+                }
+            }
+        },
+        "/friends/requests/received": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get received friend requests",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendRequestResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests/sent": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get sent friend requests",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendRequestResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests/{id}/accept": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Accept friend request",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend request ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/friends/requests/{id}/reject": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Reject friend request",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend request ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/friends/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Unfriend",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend user ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/messages": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Send a message to a friend (only friends can message each other)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Send a message",
+                "parameters": [
+                    {
+                        "description": "Message",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.SendMessageRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/dto.MessageResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/messages/{friendId}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Get message history with a friend",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend user ID",
+                        "name": "friendId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Get messages older than this ID",
+                        "name": "before_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Limit (default 20, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.MessageResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/messages/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Delete a message for myself only",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Message ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/messages/{id}/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Revoke a message for everyone",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Message ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/uploads/presign": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Get a short-lived URL to upload a file directly to object storage",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Upload"
+                ],
+                "summary": "Get presigned upload URL",
+                "parameters": [
+                    {
+                        "description": "File info",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.PresignRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.PresignResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/me": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Get information of authenticated user",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "Get current user",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.GetMeResponse"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Permanently delete the authenticated user's account and all related data (friends, messages, attachment metadata)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "Delete my account",
+                "parameters": [
+                    {
+                        "description": "Confirmation",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.DeleteMeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/user/search": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Search users by provider and keyword",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "Search users",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Provider",
+                        "name": "provider",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Search keyword",
+                        "name": "keyword",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Skip",
+                        "name": "skip",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Limit",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.SearchResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "dto.AttachmentInput": {
+            "type": "object",
+            "required": [
+                "file_name",
+                "object_key"
+            ],
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                },
+                "object_key": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.AttachmentResponse": {
+            "type": "object",
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "mime_type": {
+                    "type": "string"
+                },
+                "size_bytes": {
+                    "type": "integer"
+                },
+                "type": {
+                    "type": "string"
+                },
+                "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.DeleteMeRequest": {
+            "type": "object",
+            "required": [
+                "confirm"
+            ],
+            "properties": {
+                "confirm": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "dto.FriendRequestResponse": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "receiver_id": {
+                    "type": "integer"
+                },
+                "sender_id": {
+                    "type": "integer"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.FriendResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
+                "avatar": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.GetMeResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
+                "avatar": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.LoginRequest": {
+            "type": "object",
+            "required": [
+                "token"
+            ],
+            "properties": {
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.LoginResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.MessageResponse": {
+            "type": "object",
+            "properties": {
+                "attachments": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/dto.AttachmentResponse"
+                    }
+                },
+                "content": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "receiver_id": {
+                    "type": "integer"
+                },
+                "revoked": {
+                    "type": "boolean"
+                },
+                "sender_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "dto.PresignRequest": {
+            "type": "object",
+            "required": [
+                "file_name"
+            ],
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.PresignResponse": {
+            "type": "object",
+            "properties": {
+                "object_key": {
+                    "type": "string"
+                },
+                "upload_url": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.RefreshResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.SearchResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
+                "avatar": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.SendMessageRequest": {
+            "type": "object",
+            "required": [
+                "receiver_id"
+            ],
+            "properties": {
+                "attachments": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "$ref": "#/definitions/dto.AttachmentInput"
+                    }
+                },
+                "content": {
+                    "type": "string",
+                    "maxLength": 2000
+                },
+                "receiver_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "dto.SendRequestRequest": {
+            "type": "object",
+            "required": [
+                "receiver_id"
+            ],
+            "properties": {
+                "receiver_id": {
+                    "type": "integer"
+                }
+            }
+        }
+    },
+    "securityDefinitions": {
+        "BearerAuth": {
+            "description": "Type \"Bearer\" followed by a space and JWT token.\nExample: Bearer eyJhbGciOiJIUzI1NiIs...",
+            "type": "apiKey",
+            "name": "Authorization",
+            "in": "header"
+        }
+    }
+}`
+
+// SwaggerInfo holds exported Swagger Info so clients can modify it
+var SwaggerInfo = &swag.Spec{
+	Version:          "1.0",
+	Host:             "",
+	BasePath:         "",
+	Schemes:          []string{},
+	Title:            "GoMess API",
+	Description:      "Backend API for GoMess",
+	InfoInstanceName: "swagger",
+	SwaggerTemplate:  docTemplate,
+	LeftDelim:        "{{",
+	RightDelim:       "}}",
+}
+
+func init() {
+	swag.Register(SwaggerInfo.InstanceName(), SwaggerInfo)
+}
+
+====================================================================================================
+
+docs/swagger.json
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "Backend API for GoMess",
+        "title": "GoMess API",
+        "contact": {},
+        "version": "1.0"
+    },
+    "paths": {
+        "/auth/login": {
+            "post": {
+                "description": "Login or register user using OAuth provider",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Authentication"
+                ],
+                "summary": "Login with OAuth",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "OAuth provider",
+                        "name": "provider",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Login request",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.LoginRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.LoginResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/logout": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Logout current user and invalidate refresh token",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Authentication"
+                ],
+                "summary": "Logout",
+                "responses": {}
+            }
+        },
+        "/auth/refresh": {
+            "post": {
+                "description": "Generate a new access token using refresh token stored in cookie",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Authentication"
+                ],
+                "summary": "Refresh access token",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.RefreshResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/friends": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get friend list",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Send a friend request to another user (auto-accepts if that user already sent one to you)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Send friend request",
+                "parameters": [
+                    {
+                        "description": "Receiver",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.SendRequestRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created"
+                    }
+                }
+            }
+        },
+        "/friends/requests/received": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get received friend requests",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendRequestResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests/sent": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Get sent friend requests",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.FriendRequestResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/friends/requests/{id}/accept": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Accept friend request",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend request ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/friends/requests/{id}/reject": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Reject friend request",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend request ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/friends/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Friend"
+                ],
+                "summary": "Unfriend",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend user ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/messages": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Send a message to a friend (only friends can message each other)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Send a message",
+                "parameters": [
+                    {
+                        "description": "Message",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.SendMessageRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/dto.MessageResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/messages/{friendId}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Get message history with a friend",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Friend user ID",
+                        "name": "friendId",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Get messages older than this ID",
+                        "name": "before_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Limit (default 20, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.MessageResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/messages/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Delete a message for myself only",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Message ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/messages/{id}/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Message"
+                ],
+                "summary": "Revoke a message for everyone",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Message ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/uploads/presign": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Get a short-lived URL to upload a file directly to object storage",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Upload"
+                ],
+                "summary": "Get presigned upload URL",
+                "parameters": [
+                    {
+                        "description": "File info",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.PresignRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.PresignResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/user/me": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Get information of authenticated user",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "Get current user",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.GetMeResponse"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Permanently delete the authenticated user's account and all related data (friends, messages, attachment metadata)",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "Delete my account",
+                "parameters": [
+                    {
+                        "description": "Confirmation",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.DeleteMeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
+        },
+        "/user/search": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Search users by provider and keyword",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "Search users",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Provider",
+                        "name": "provider",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Search keyword",
+                        "name": "keyword",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Skip",
+                        "name": "skip",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Limit",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/dto.SearchResponse"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "dto.AttachmentInput": {
+            "type": "object",
+            "required": [
+                "file_name",
+                "object_key"
+            ],
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                },
+                "object_key": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.AttachmentResponse": {
+            "type": "object",
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "mime_type": {
+                    "type": "string"
+                },
+                "size_bytes": {
+                    "type": "integer"
+                },
+                "type": {
+                    "type": "string"
+                },
+                "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.DeleteMeRequest": {
+            "type": "object",
+            "required": [
+                "confirm"
+            ],
+            "properties": {
+                "confirm": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "dto.FriendRequestResponse": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "receiver_id": {
+                    "type": "integer"
+                },
+                "sender_id": {
+                    "type": "integer"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.FriendResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
+                "avatar": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.GetMeResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
+                "avatar": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.LoginRequest": {
+            "type": "object",
+            "required": [
+                "token"
+            ],
+            "properties": {
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.LoginResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.MessageResponse": {
+            "type": "object",
+            "properties": {
+                "attachments": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/dto.AttachmentResponse"
+                    }
+                },
+                "content": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "receiver_id": {
+                    "type": "integer"
+                },
+                "revoked": {
+                    "type": "boolean"
+                },
+                "sender_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "dto.PresignRequest": {
+            "type": "object",
+            "required": [
+                "file_name"
+            ],
+            "properties": {
+                "file_name": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.PresignResponse": {
+            "type": "object",
+            "properties": {
+                "object_key": {
+                    "type": "string"
+                },
+                "upload_url": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.RefreshResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.SearchResponse": {
+            "type": "object",
+            "properties": {
+                "account": {
+                    "type": "string"
+                },
+                "avatar": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.SendMessageRequest": {
+            "type": "object",
+            "required": [
+                "receiver_id"
+            ],
+            "properties": {
+                "attachments": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "$ref": "#/definitions/dto.AttachmentInput"
+                    }
+                },
+                "content": {
+                    "type": "string",
+                    "maxLength": 2000
+                },
+                "receiver_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "dto.SendRequestRequest": {
+            "type": "object",
+            "required": [
+                "receiver_id"
+            ],
+            "properties": {
+                "receiver_id": {
+                    "type": "integer"
+                }
+            }
+        }
+    },
+    "securityDefinitions": {
+        "BearerAuth": {
+            "description": "Type \"Bearer\" followed by a space and JWT token.\nExample: Bearer eyJhbGciOiJIUzI1NiIs...",
+            "type": "apiKey",
+            "name": "Authorization",
+            "in": "header"
+        }
+    }
+}
+
+====================================================================================================
+
+docs/swagger.yaml
+definitions:
+  dto.AttachmentInput:
+    properties:
+      file_name:
+        type: string
+      object_key:
+        type: string
+    required:
+    - file_name
+    - object_key
+    type: object
+  dto.AttachmentResponse:
+    properties:
+      file_name:
+        type: string
+      id:
+        type: integer
+      mime_type:
+        type: string
+      size_bytes:
+        type: integer
+      type:
+        type: string
+      url:
+        type: string
+    type: object
+  dto.DeleteMeRequest:
+    properties:
+      confirm:
+        type: boolean
+    required:
+    - confirm
+    type: object
+  dto.FriendRequestResponse:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: integer
+      receiver_id:
+        type: integer
+      sender_id:
+        type: integer
+      status:
+        type: string
+    type: object
+  dto.FriendResponse:
+    properties:
+      account:
+        type: string
+      avatar:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      provider:
+        type: string
+    type: object
+  dto.GetMeResponse:
+    properties:
+      account:
+        type: string
+      avatar:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+    type: object
+  dto.LoginRequest:
+    properties:
+      token:
+        type: string
+    required:
+    - token
+    type: object
+  dto.LoginResponse:
+    properties:
+      access_token:
+        type: string
+    type: object
+  dto.MessageResponse:
+    properties:
+      attachments:
+        items:
+          $ref: '#/definitions/dto.AttachmentResponse'
+        type: array
+      content:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: integer
+      receiver_id:
+        type: integer
+      revoked:
+        type: boolean
+      sender_id:
+        type: integer
+    type: object
+  dto.PresignRequest:
+    properties:
+      file_name:
+        type: string
+    required:
+    - file_name
+    type: object
+  dto.PresignResponse:
+    properties:
+      object_key:
+        type: string
+      upload_url:
+        type: string
+    type: object
+  dto.RefreshResponse:
+    properties:
+      access_token:
+        type: string
+    type: object
+  dto.SearchResponse:
+    properties:
+      account:
+        type: string
+      avatar:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      provider:
+        type: string
+    type: object
+  dto.SendMessageRequest:
+    properties:
+      attachments:
+        items:
+          $ref: '#/definitions/dto.AttachmentInput'
+        maxItems: 10
+        type: array
+      content:
+        maxLength: 2000
+        type: string
+      receiver_id:
+        type: integer
+    required:
+    - receiver_id
+    type: object
+  dto.SendRequestRequest:
+    properties:
+      receiver_id:
+        type: integer
+    required:
+    - receiver_id
+    type: object
+info:
+  contact: {}
+  description: Backend API for GoMess
+  title: GoMess API
+  version: "1.0"
+paths:
+  /auth/login:
+    post:
+      consumes:
+      - application/json
+      description: Login or register user using OAuth provider
+      parameters:
+      - description: OAuth provider
+        in: path
+        name: provider
+        required: true
+        type: string
+      - description: Login request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.LoginResponse'
+      summary: Login with OAuth
+      tags:
+      - Authentication
+  /auth/logout:
+    post:
+      description: Logout current user and invalidate refresh token
+      produces:
+      - application/json
+      responses: {}
+      security:
+      - BearerAuth: []
+      summary: Logout
+      tags:
+      - Authentication
+  /auth/refresh:
+    post:
+      description: Generate a new access token using refresh token stored in cookie
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.RefreshResponse'
+      summary: Refresh access token
+      tags:
+      - Authentication
+  /friends:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.FriendResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get friend list
+      tags:
+      - Friend
+  /friends/{id}:
+    delete:
+      parameters:
+      - description: Friend user ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Unfriend
+      tags:
+      - Friend
+  /friends/requests:
+    post:
+      consumes:
+      - application/json
+      description: Send a friend request to another user (auto-accepts if that user
+        already sent one to you)
+      parameters:
+      - description: Receiver
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.SendRequestRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+      security:
+      - BearerAuth: []
+      summary: Send friend request
+      tags:
+      - Friend
+  /friends/requests/{id}/accept:
+    post:
+      parameters:
+      - description: Friend request ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Accept friend request
+      tags:
+      - Friend
+  /friends/requests/{id}/reject:
+    post:
+      parameters:
+      - description: Friend request ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Reject friend request
+      tags:
+      - Friend
+  /friends/requests/received:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.FriendRequestResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get received friend requests
+      tags:
+      - Friend
+  /friends/requests/sent:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.FriendRequestResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get sent friend requests
+      tags:
+      - Friend
+  /messages:
+    post:
+      consumes:
+      - application/json
+      description: Send a message to a friend (only friends can message each other)
+      parameters:
+      - description: Message
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.SendMessageRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.MessageResponse'
+      security:
+      - BearerAuth: []
+      summary: Send a message
+      tags:
+      - Message
+  /messages/{friendId}:
+    get:
+      parameters:
+      - description: Friend user ID
+        in: path
+        name: friendId
+        required: true
+        type: integer
+      - description: Get messages older than this ID
+        in: query
+        name: before_id
+        type: integer
+      - description: Limit (default 20, max 100)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.MessageResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Get message history with a friend
+      tags:
+      - Message
+  /messages/{id}:
+    delete:
+      parameters:
+      - description: Message ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Delete a message for myself only
+      tags:
+      - Message
+  /messages/{id}/revoke:
+    post:
+      parameters:
+      - description: Message ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Revoke a message for everyone
+      tags:
+      - Message
+  /uploads/presign:
+    post:
+      consumes:
+      - application/json
+      description: Get a short-lived URL to upload a file directly to object storage
+      parameters:
+      - description: File info
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.PresignRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.PresignResponse'
+      security:
+      - BearerAuth: []
+      summary: Get presigned upload URL
+      tags:
+      - Upload
+  /user/me:
+    delete:
+      consumes:
+      - application/json
+      description: Permanently delete the authenticated user's account and all related
+        data (friends, messages, attachment metadata)
+      parameters:
+      - description: Confirmation
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.DeleteMeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Delete my account
+      tags:
+      - User
+    get:
+      description: Get information of authenticated user
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.GetMeResponse'
+      security:
+      - BearerAuth: []
+      summary: Get current user
+      tags:
+      - User
+  /user/search:
+    get:
+      description: Search users by provider and keyword
+      parameters:
+      - description: Provider
+        in: query
+        name: provider
+        required: true
+        type: string
+      - description: Search keyword
+        in: query
+        name: keyword
+        required: true
+        type: string
+      - description: Skip
+        in: query
+        name: skip
+        type: integer
+      - description: Limit
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/dto.SearchResponse'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: Search users
+      tags:
+      - User
+securityDefinitions:
+  BearerAuth:
+    description: |-
+      Type "Bearer" followed by a space and JWT token.
+      Example: Bearer eyJhbGciOiJIUzI1NiIs...
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"
+
+====================================================================================================
+
+internal/app/app.go
+package app
+
+import (
+	"context"
+	"gomess/internal/config"
+	"gomess/internal/database"
+	"gomess/internal/logger"
+	"gomess/internal/middleware"
+	"gomess/internal/modules"
+	"gomess/internal/modules/auth"
+	"gomess/internal/modules/friend"
+	"gomess/internal/modules/message"
+	"gomess/internal/modules/upload"
+	"gomess/internal/modules/user"
+	"gomess/internal/redis"
+	"gomess/internal/ws"
+	"gomess/pkg/jwt"
+	"gomess/pkg/storage"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
+)
+
+type Application struct {
+	router *gin.Engine
+	config config.ConfigInterface
+	log    *slog.Logger
+}
+
+func NewApplication(cfg config.ConfigInterface) (*Application, error) {
+	appLogger := logger.New(cfg.IsProduction())
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	r.Use(middleware.WithLogger(appLogger))
+	r.Use(middleware.Logging(appLogger))
+	r.Use(middleware.Recovery(appLogger))
+
+	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+
+	r.Use(cors.New(cors.Config{
+		AllowOrigins: []string{
+			"http://localhost:3000",
+		},
+		AllowMethods: []string{
+			"GET",
+			"POST",
+			"PUT",
+			"PATCH",
+			"DELETE",
+			"OPTIONS",
+		},
+		AllowHeaders: []string{
+			"Origin",
+			"Content-Type",
+			"Authorization",
+		},
+		AllowCredentials: cfg.AllowCredentials(),
+		MaxAge:           12 * time.Hour,
+	}))
+
+	db, err := database.NewMySql(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	jwt := jwt.NewJWT(cfg.GetJWTSecret())
+
+	redis := redis.NewRedis(cfg.GetRedisAddr())
+
+	ctx := &modules.ModuleContext{
+		DB:    db,
+		JWT:   jwt,
+		Cfg:   cfg,
+		Redis: redis,
+	}
+
+	storageClient, err := storage.NewStorage(
+		cfg.GetMinioEndpoint(),
+		cfg.GetMinioAccessKey(),
+		cfg.GetMinioSecretKey(),
+		cfg.GetMinioBucket(),
+		cfg.MinioUseSSL(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	userRepo := user.NewRepository(db)
+	friendRepo := friend.NewRepository(db)
+	messageRepo := message.NewRepository(db)
+
+	hub := ws.NewHub()
+
+	modules := []modules.ModuleInterface{
+		auth.NewModule(ctx),
+		user.NewModule(ctx, userRepo),
+		friend.NewModule(ctx, friendRepo, userRepo, messageRepo),
+		message.NewModule(ctx, friendRepo, storageClient, hub),
+		upload.NewModule(ctx, storageClient),
+		ws.NewModule(ctx, hub),
+	}
+
+	api := r.Group("/api")
+
+	for _, module := range modules {
+		module.RegisterRoutes(api)
+	}
+
+	return &Application{
+		router: r,
+		config: cfg,
+		log:    appLogger,
+	}, nil
+}
+
+func (a *Application) Run() error {
+	srv := &http.Server{
+		Addr:    a.config.GetPort(),
+		Handler: a.router,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			a.log.Error("server failed to start", "error", err)
+			return
+		}
+	}()
+
+	a.log.Info("server running", "port", a.config.GetPort())
+
+	quit := make(chan os.Signal, 1)
+
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	<-quit
+
+	a.log.Info("shutting down server")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+	defer cancel()
+
+	return srv.Shutdown(ctx)
+}
+
+====================================================================================================
+
+internal/config/config.go
+package config
+
+import (
+	"os"
+	"strconv"
+
+	"github.com/joho/godotenv"
+)
+
+type ConfigInterface interface {
+	GetPort() string
+	GetDBUrl() string
+	GetGoogleClientID() string
+	GetJWTSecret() string
+	GetRedisAddr() string
+	IsProduction() bool
+	AllowCredentials() bool
+	GetMinioEndpoint() string
+	GetMinioAccessKey() string
+	GetMinioSecretKey() string
+	GetMinioBucket() string
+	MinioUseSSL() bool
+	WorkerCleanupIntervalHours() int
+}
+
+type Config struct {
+	port                       string
+	dbUrl                      string
+	jwtSecret                  string
+	googleClientID             string
+	redisAddr                  string
+	isProduction               bool
+	allowCredentials           bool
+	minioEndpoint              string
+	minioAccessKey             string
+	minioSecretKey             string
+	minioBucket                string
+	minioUseSSL                bool
+	workerCleanupIntervalHours int
+}
+
+func NewConfig() *Config {
+	godotenv.Load()
+
+	isProduction, _ := strconv.ParseBool(os.Getenv("IS_PRODUCTION"))
+	allowCredentials, _ := strconv.ParseBool(os.Getenv("ALLOW_CREDENTIALS"))
+	minioUseSSL, _ := strconv.ParseBool(os.Getenv("MINIO_USE_SSL"))
+	workerCleanupIntervalHours, err := strconv.Atoi(os.Getenv("WORKER_CLEANUP_INTERVAL_HOURS"))
+	if err != nil || workerCleanupIntervalHours <= 0 {
+		workerCleanupIntervalHours = 6
+	}
+
+	return &Config{
+		port:                       os.Getenv("PORT"),
+		dbUrl:                      os.Getenv("DB_URL"),
+		jwtSecret:                  os.Getenv("JWT_SECRET"),
+		googleClientID:             os.Getenv("GOOGLE_CLIENT_ID"),
+		redisAddr:                  os.Getenv("REDIS_ADDR"),
+		isProduction:               isProduction,
+		allowCredentials:           allowCredentials,
+		minioEndpoint:              os.Getenv("MINIO_ENDPOINT"),
+		minioAccessKey:             os.Getenv("MINIO_ACCESS_KEY"),
+		minioSecretKey:             os.Getenv("MINIO_SECRET_KEY"),
+		minioBucket:                os.Getenv("MINIO_BUCKET"),
+		minioUseSSL:                minioUseSSL,
+		workerCleanupIntervalHours: workerCleanupIntervalHours,
+	}
+}
+
+func (c *Config) GetPort() string                 { return c.port }
+func (c *Config) GetDBUrl() string                { return c.dbUrl }
+func (c *Config) GetGoogleClientID() string       { return c.googleClientID }
+func (c *Config) GetJWTSecret() string            { return c.jwtSecret }
+func (c *Config) GetRedisAddr() string            { return c.redisAddr }
+func (c *Config) IsProduction() bool              { return c.isProduction }
+func (c *Config) AllowCredentials() bool          { return c.allowCredentials }
+func (c *Config) GetMinioEndpoint() string        { return c.minioEndpoint }
+func (c *Config) GetMinioAccessKey() string       { return c.minioAccessKey }
+func (c *Config) GetMinioSecretKey() string       { return c.minioSecretKey }
+func (c *Config) GetMinioBucket() string          { return c.minioBucket }
+func (c *Config) MinioUseSSL() bool               { return c.minioUseSSL }
+func (c *Config) WorkerCleanupIntervalHours() int { return c.workerCleanupIntervalHours }
+
+====================================================================================================
+
+internal/context/context.go
+package context
+
+const (
+	UserIDKey       = "userID"
+	RequestIDKey    = "requestID"
+	RequestIDHeader = "X-Request-ID"
+	LoggerKey       = "logger"
+)
+
+====================================================================================================
+
+internal/database/database.go
+package database
+
+import (
+	"database/sql"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+type DatabaseInterface interface {
+	GetDB() *sql.DB
+	WithTransaction(fn TxFunc) error
+}
+
+type Database struct {
+	db *sql.DB
+}
+
+func (d *Database) GetDB() *sql.DB {
+	return d.db
+}
+
+====================================================================================================
+
+internal/database/mysql.go
+package database
+
+import (
+	"database/sql"
+	"gomess/internal/config"
+)
+
+func NewMySql(cfg config.ConfigInterface) (*Database, error) {
+	db, err := sql.Open("mysql", cfg.GetDBUrl())
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+
+	return &Database{
+		db: db,
+	}, nil
+}
+
+====================================================================================================
+
+internal/database/transaction.go
+package database
+
+import "database/sql"
+
+type TxFunc func(*sql.Tx) error
+
+func (d *Database) WithTransaction(fn TxFunc) error {
+	tx, err := d.db.Begin()
+
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
+}
+
+====================================================================================================
+
+internal/logger/context.go
+package logger
+
+import (
+	"gomess/internal/context"
+	"log/slog"
+
+	"github.com/gin-gonic/gin"
+)
+
+func Inject(c *gin.Context, log *slog.Logger) {
+	c.Set(context.LoggerKey, log)
+}
+
+func FromGin(c *gin.Context) *slog.Logger {
+	if v, ok := c.Get(context.LoggerKey); ok {
+		if l, ok := v.(*slog.Logger); ok {
+			return l
+		}
+	}
+	return slog.Default()
+}
+
+====================================================================================================
+
+internal/logger/logger.go
+package logger
+
+import (
+	"log/slog"
+	"os"
+)
+
+func New(isProduction bool) *slog.Logger {
+	level := slog.LevelDebug
+	if isProduction {
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+
+	var handler slog.Handler
+	if isProduction {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+
+	return slog.New(handler)
+}
+
+====================================================================================================
+
+internal/middleware/auth.go
+package middleware
+
+import (
+	"errors"
+	"gomess/internal/context"
+	"gomess/pkg/jwt"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+func Auth(j jwt.JWTInterface) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+
+		if auth == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "authorization header is required",
+				"code":  "TOKEN_MISSING",
+			})
+			c.Abort()
+			return
+		}
+
+		if !strings.HasPrefix(auth, "Bearer ") {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "invalid authorization header",
+				"code":  "TOKEN_INVALID",
+			})
+			c.Abort()
+			return
+		}
+
+		token := strings.TrimPrefix(auth, "Bearer ")
+
+		userID, err := j.ParseAccessToken(token)
+		if err != nil {
+			if errors.Is(err, jwt.ErrExpiredToken) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error": "access token expired",
+					"code":  "TOKEN_EXPIRED",
+				})
+			} else {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error": "invalid token",
+					"code":  "TOKEN_INVALID",
+				})
+			}
+			c.Abort()
+			return
+		}
+
+		c.Set(context.UserIDKey, userID)
+
+		c.Next()
+	}
+}
+
+====================================================================================================
+
+internal/middleware/logging.go
+package middleware
+
+import (
+	"gomess/internal/context"
+	"gomess/internal/logger"
+	"log/slog"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func WithLogger(log *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		requestID, _ := c.Get(context.RequestIDKey)
+		logger.Inject(c, log.With("request_id", requestID))
+		c.Next()
+	}
+}
+
+func Logging(log *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		if raw := c.Request.URL.RawQuery; raw != "" {
+			path += "?" + raw
+		}
+
+		c.Next()
+
+		requestID, _ := c.Get(context.RequestIDKey)
+
+		attrs := []any{
+			"request_id", requestID,
+			"method", c.Request.Method,
+			"path", path,
+			"status", c.Writer.Status(),
+			"latency_ms", time.Since(start).Milliseconds(),
+			"client_ip", c.ClientIP(),
+		}
+
+		if len(c.Errors) > 0 {
+			attrs = append(attrs, "errors", c.Errors.String())
+		}
+
+		switch {
+		case c.Writer.Status() >= 500:
+			log.Error("request completed", attrs...)
+		case c.Writer.Status() >= 400:
+			log.Warn("request completed", attrs...)
+		default:
+			log.Info("request completed", attrs...)
+		}
+	}
+}
+
+====================================================================================================
+
+internal/middleware/rate_limit.go
+package middleware
+
+import (
+	"context"
+	appcontext "gomess/internal/context"
+	"gomess/internal/logger"
+	"gomess/internal/redis"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func RateLimit(
+	rdb redis.RedisInterface,
+	prefix string,
+	limit int,
+	window time.Duration,
+	keyFunc func(c *gin.Context) string,
+) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := "ratelimit:" + prefix + ":" + keyFunc(c)
+
+		count, err := rdb.Incr(context.Background(), key)
+		if err != nil {
+			// Redis error/cannot connect -> skip
+			logger.FromGin(c).Error("rate limit error", "error", err)
+			c.Next()
+			return
+		}
+
+		if count == 1 {
+			if err := rdb.Expire(context.Background(), key, window); err != nil {
+				logger.FromGin(c).Error("rate limit expire error", "error", err)
+			}
+		}
+
+		if count > int64(limit) {
+			c.Header("Retry-After", window.String())
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error": "too many requests, please try again later",
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func RateLimitByIP(c *gin.Context) string {
+	return c.ClientIP()
+}
+
+func RateLimitByUser(c *gin.Context) string {
+	userID := c.GetInt64(appcontext.UserIDKey)
+	return strconv.FormatInt(userID, 10)
+}
+
+====================================================================================================
+
+internal/middleware/recovery.go
+package middleware
+
+import (
+	"gomess/internal/context"
+	"log/slog"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+func Recovery(log *slog.Logger) gin.HandlerFunc {
+	return gin.CustomRecovery(func(c *gin.Context, recovered any) {
+		requestID, _ := c.Get(context.RequestIDKey)
+
+		log.Error(
+			"panic recovered",
+			"request_id", requestID,
+			"panic", recovered,
+			"path", c.Request.URL.Path,
+		)
+
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+	})
+}
+
+====================================================================================================
+
+internal/middleware/request_id.go
+package middleware
+
+import (
+	"gomess/internal/context"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+func RequestID() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		requestID := c.GetHeader(context.RequestIDHeader)
+		if requestID == "" {
+			requestID = uuid.NewString()
+		}
+
+		c.Set(context.RequestIDKey, requestID)
+		c.Header(context.RequestIDHeader, requestID)
+
+		c.Next()
+	}
+}
+
+====================================================================================================
+
+internal/models/friend.go
+package models
+
+import "time"
+
+type Friend struct {
+	User1ID   int64
+	User2ID   int64
+	CreatedAt time.Time
+}
+
+====================================================================================================
+
+internal/models/friend_request.go
+package models
+
+import "time"
+
+type FriendRequest struct {
+	ID         int64
+	SenderID   int64
+	ReceiverID int64
+	Status     string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+====================================================================================================
+
+internal/models/message.go
+package models
+
+import "time"
+
+type Message struct {
+	ID          int64
+	SenderID    int64
+	ReceiverID  int64
+	Content     string
+	CreatedAt   time.Time
+	RevokedAt   *time.Time
+	Attachments []MessageAttachment
+}
+
+type MessageAttachment struct {
+	ID        int64
+	MessageID int64
+	Type      string
+	ObjectKey string
+	FileName  string
+	MimeType  string
+	SizeBytes int64
+	CreatedAt time.Time
+}
+
+====================================================================================================
+
+internal/models/user.go
+package models
+
+type User struct {
+	ID         int64
+	Provider   string
+	ProviderID string
+	Account    string
+	Name       string
+	Avatar     string
+}
+
+====================================================================================================
+
+internal/modules/auth/dto/login_request.go
+package dto
+
+type LoginRequest struct {
+	Token string `json:"token" binding:"required"`
+}
+
+====================================================================================================
+
+internal/modules/auth/dto/login_response.go
+package dto
+
+type LoginResponse struct {
+	AccessToken string `json:"access_token"`
+}
+
+====================================================================================================
+
+internal/modules/auth/dto/refresh_response.go
+package dto
+
+type RefreshResponse struct {
+	AccessToken string `json:"access_token"`
+}
+
+====================================================================================================
+
+internal/modules/auth/errors.go
+package auth
+
+import "errors"
+
+var (
+	ErrUnsupportedProvider = errors.New("unsupported provider")
+	ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
+)
+
+====================================================================================================
+
+internal/modules/auth/handler.go
+package auth
+
+import (
+	"errors"
+	"gomess/internal/config"
+	"gomess/internal/modules/auth/dto"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type HandlerInterface interface {
+	Login(c *gin.Context)
+	Refresh(c *gin.Context)
+	Logout(c *gin.Context)
+}
+
+type Handler struct {
+	service ServiceInterface
+	cfg     config.ConfigInterface
+}
+
+func NewHandler(service ServiceInterface, cfg config.ConfigInterface) *Handler {
+	return &Handler{service: service, cfg: cfg}
+}
+
+// Login godoc
+//
+//	@Summary		Login with OAuth
+//	@Description	Login or register user using OAuth provider
+//	@Tags			Authentication
+//
+//	@Accept			json
+//	@Produce		json
+//
+//	@Param			provider	path		string				true	"OAuth provider"
+//	@Param			request		body		dto.LoginRequest	true	"Login request"
+//
+//	@Success		200			{object}	dto.LoginResponse
+//
+//	@Router			/auth/login [post]
+func (h *Handler) Login(c *gin.Context) {
+	provider := c.Param("provider")
+
+	var req dto.LoginRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	result, refreshToken, err := h.service.Login(provider, req.Token)
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "login failed"})
+		return
+	}
+
+	h.setRefreshCookie(c, refreshToken)
+
+	c.JSON(http.StatusOK, result)
+}
+
+// Refresh godoc
+//
+//	@Summary		Refresh access token
+//	@Description	Generate a new access token using refresh token stored in cookie
+//	@Tags			Authentication
+//
+//	@Produce		json
+//
+//	@Success		200	{object}	dto.RefreshResponse
+//
+//	@Router			/auth/refresh [post]
+func (h *Handler) Refresh(c *gin.Context) {
+	refreshToken, err := c.Cookie("refresh_token")
+
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired cookie refresh token"})
+		return
+	}
+
+	result, newRefreshToken, err := h.service.Refresh(refreshToken)
+
+	if err != nil {
+		h.clearRefreshCookie(c)
+
+		if errors.Is(err, ErrInvalidRefreshToken) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired refresh token"})
+			return
+		}
+
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	h.setRefreshCookie(c, newRefreshToken)
+
+	c.JSON(http.StatusOK, result)
+}
+
+// Logout godoc
+//
+//	@Summary		Logout
+//	@Description	Logout current user and invalidate refresh token
+//	@Tags			Authentication
+//
+//	@Produce		json
+//
+//	@Security		BearerAuth
+//
+//	@Router			/auth/logout [post]
+func (h *Handler) Logout(c *gin.Context) {
+	refreshToken, err := c.Cookie("refresh_token")
+
+	if err == nil {
+		h.service.Logout(refreshToken)
+	}
+
+	h.clearRefreshCookie(c)
+
+	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
+}
+
+func (h *Handler) sameSiteMode() http.SameSite {
+	if h.cfg.IsProduction() {
+		return http.SameSiteNoneMode
+	}
+	return http.SameSiteLaxMode
+}
+
+func (h *Handler) setRefreshCookie(c *gin.Context, refreshToken string) {
+	c.SetSameSite(h.sameSiteMode())
+	c.SetCookie(
+		"refresh_token",
+		refreshToken,
+		int((30 * 24 * time.Hour).Seconds()),
+		"/",
+		"",
+		h.cfg.IsProduction(),
+		true,
+	)
+}
+
+func (h *Handler) clearRefreshCookie(c *gin.Context) {
+	c.SetSameSite(h.sameSiteMode())
+	c.SetCookie(
+		"refresh_token",
+		"",
+		-1,
+		"/",
+		"",
+		h.cfg.IsProduction(),
+		true,
+	)
+}
+
+====================================================================================================
+
+internal/modules/auth/module.go
+package auth
+
+import (
+	"gomess/internal/middleware"
+	"gomess/internal/modules"
+	"gomess/internal/redis"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Module struct {
+	handler HandlerInterface
+	redis   redis.RedisInterface
+}
+
+func NewModule(ctx *modules.ModuleContext) *Module {
+
+	handler := NewHandler(NewService(NewRepository(ctx.DB), ctx.JWT, ctx.Cfg, ctx.Redis), ctx.Cfg)
+
+	return &Module{handler: handler, redis: ctx.Redis}
+}
+
+func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
+	auth := rg.Group("/auth")
+
+	auth.POST(
+		"/:provider", 
+		middleware.RateLimit(m.redis, "login", 5, time.Minute, middleware.RateLimitByIP),
+		m.handler.Login,
+	)
+	auth.POST("/refresh", m.handler.Refresh)
+	auth.POST("/logout", m.handler.Logout)
+}
+
+====================================================================================================
+
+internal/modules/auth/repository.go
+package auth
+
+import (
+	"database/sql"
+	"gomess/internal/database"
+	"gomess/internal/models"
+)
+
+type RepositoryInterface interface {
+	FindByProvider(provider, providerID string) (*models.User, error)
+	Create(user *models.User) error
+}
+
+type Repository struct {
+	db database.DatabaseInterface
+}
+
+func NewRepository(db database.DatabaseInterface) *Repository {
+	return &Repository{db: db}
+}
+
+func (r *Repository) FindByProvider(provider, providerID string) (*models.User, error) {
+	query := `
+	SELECT id, provider, provider_id, account, name, avatar
+	FROM users
+	WHERE provider = ? AND provider_id = ?
+	LIMIT 1
+	`
+
+	row := r.db.GetDB().QueryRow(query, provider, providerID)
+
+	var user models.User
+
+	err := row.Scan(
+		&user.ID,
+		&user.Provider,
+		&user.ProviderID,
+		&user.Account,
+		&user.Name,
+		&user.Avatar,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+func (r *Repository) Create(user *models.User) error {
+	query := `
+	INSERT INTO users(provider, provider_id, account, name, avatar)
+	VALUES (?, ?, ?, ?, ?)
+	`
+
+	result, err := r.db.GetDB().Exec(
+		query,
+		user.Provider,
+		user.ProviderID,
+		user.Account,
+		user.Name,
+		user.Avatar,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	id, _ := result.LastInsertId()
+
+	user.ID = id
+
+	return nil
+}
+
+====================================================================================================
+
+internal/modules/auth/service.go
+package auth
+
+import (
+	"context"
+	"errors"
+	"gomess/internal/config"
+	"gomess/internal/models"
+	"gomess/internal/modules/auth/dto"
+	"gomess/internal/redis"
+	"gomess/pkg/authprovider"
+	"gomess/pkg/jwt"
+	"gomess/utils"
+	"strconv"
+	"time"
+)
+
+type ServiceInterface interface {
+	Login(providerName, token string) (*dto.LoginResponse, string, error)
+	Refresh(refreshToken string) (*dto.RefreshResponse, string, error)
+	Logout(refreshToken string) error
+}
+
+type Service struct {
+	repo      RepositoryInterface
+	providers map[string]authprovider.ProviderInterface
+	jwt       jwt.JWTInterface
+	redis     redis.RedisInterface
+}
+
+func NewService(repo RepositoryInterface, jwt jwt.JWTInterface, cfg config.ConfigInterface, redis redis.RedisInterface) *Service {
+	return &Service{
+		repo: repo,
+		providers: map[string]authprovider.ProviderInterface{
+			"google": authprovider.NewGoogleProvider(cfg.GetGoogleClientID()),
+		},
+		jwt:   jwt,
+		redis: redis,
+	}
+}
+
+func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string, error) {
+	provider, ok := s.providers[providerName]
+	if !ok {
+		return nil, "", ErrUnsupportedProvider
+	}
+
+	info, err := provider.Verify(token)
+	if err != nil {
+		return nil, "", err
+	}
+
+	u, err := s.repo.FindByProvider(providerName, info.ID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if u == nil {
+		u = &models.User{
+			Provider:   providerName,
+			ProviderID: info.ID,
+			Account:    info.Account,
+			Name:       info.Name,
+			Avatar:     info.Avatar,
+		}
+		if err := s.repo.Create(u); err != nil {
+			return nil, "", err
+		}
+	}
+
+	accessToken, err := s.jwt.GenerateAccessToken(u.ID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	refreshToken, err := s.issueRefreshToken(u.ID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return &dto.LoginResponse{
+		AccessToken: accessToken,
+	}, refreshToken, nil
+}
+
+func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, string, error){
+	userID, err := s.redis.GetDel(
+		context.Background(),
+		"refresh:"+utils.SHA256(refreshToken),
+	)
+	if err != nil {
+		if errors.Is(err, redis.ErrNotFound) {
+			return nil, "", ErrInvalidRefreshToken
+		}
+		return nil, "", err
+	}
+
+	id, err := strconv.ParseInt(userID, 10, 64)
+	if err != nil {
+		return nil, "", ErrInvalidRefreshToken
+	}
+
+	accessToken, err := s.jwt.GenerateAccessToken(id)
+	if err != nil {
+		return nil, "", err
+	}
+
+	newRefreshToken, err := s.issueRefreshToken(id)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return &dto.RefreshResponse{
+		AccessToken: accessToken,
+	}, newRefreshToken, nil
+}
+
+func (s *Service) Logout(refreshToken string) error {
+	return s.redis.Delete(
+		context.Background(),
+		"refresh:"+utils.SHA256(refreshToken),
+	)
+}
+
+func (s *Service) issueRefreshToken(userID int64) (string, error) {
+	refreshToken, err := s.jwt.GenerateRefreshToken()
+	if err != nil {
+		return "", err
+	}
+
+	err = s.redis.Set(
+		context.Background(),
+		"refresh:"+utils.SHA256(refreshToken),
+		strconv.FormatInt(userID, 10),
+		30 * 24 * time.Hour,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return refreshToken, nil
+}
+
+====================================================================================================
+
+internal/modules/friend/const.go
+package friend
+
+const (
+	RequestPending  = "pending"
+	RequestAccepted = "accepted"
+	RequestRejected = "rejected"
+)
+
+====================================================================================================
+
+internal/modules/friend/dto/friend_request_response.go
+package dto
+
+import "time"
+
+type FriendRequestResponse struct {
+	ID         int64     `json:"id"`
+	SenderID   int64     `json:"sender_id"`
+	ReceiverID int64     `json:"receiver_id"`
+	Status     string    `json:"status"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+====================================================================================================
+
+internal/modules/friend/dto/friend_response.go
+package dto
+
+type FriendResponse struct {
+	ID       int64  `json:"id"`
+	Provider string `json:"provider"`
+	Account  string `json:"account"`
+	Name     string `json:"name"`
+	Avatar   string `json:"avatar"`
+}
+
+====================================================================================================
+
+internal/modules/friend/dto/send_request_request.go
+package dto
+
+type SendRequestRequest struct {
+	ReceiverID int64 `json:"receiver_id" binding:"required"`
+}
+
+====================================================================================================
+
+internal/modules/friend/errors.go
+package friend
+
+import "errors"
+
+var (
+	ErrUserNotFound      = errors.New("user not found")
+	ErrAlreadyFriend     = errors.New("already friend")
+	ErrRequestExists     = errors.New("friend request already exists")
+	ErrCannotAddYourself = errors.New("cannot add yourself")
+	ErrRequestNotFound   = errors.New("friend request not found")
+	ErrForbidden         = errors.New("forbidden")
+	ErrNotFriend         = errors.New("not friend")
+)
+
+====================================================================================================
+
+internal/modules/friend/handler.go
+package friend
+
+import (
+	"errors"
+	"gomess/internal/context"
+	"gomess/internal/logger"
+	"gomess/internal/modules/friend/dto"
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+)
+
+type HandlerInterface interface {
+	SendRequest(c *gin.Context)
+	AcceptRequest(c *gin.Context)
+	RejectRequest(c *gin.Context)
+	DeleteFriend(c *gin.Context)
+	GetFriends(c *gin.Context)
+	GetReceivedRequests(c *gin.Context)
+	GetSentRequests(c *gin.Context)
+}
+
+type Handler struct {
+	service ServiceInterface
+}
+
+func NewHandler(service ServiceInterface) *Handler {
+	return &Handler{service: service}
+}
+
+// SendRequest godoc
+//
+//	@Summary		Send friend request
+//	@Description	Send a friend request to another user (auto-accepts if that user already sent one to you)
+//	@Tags			Friend
+//	@Accept			json
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			request	body	dto.SendRequestRequest	true	"Receiver"
+//	@Success		201
+//	@Router			/friends/requests [post]
+func (h *Handler) SendRequest(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	var req dto.SendRequestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if err := h.service.SendRequest(userID, req.ReceiverID); err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "friend request sent"})
+}
+
+// AcceptRequest godoc
+//
+//	@Summary		Accept friend request
+//	@Tags			Friend
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			id	path	int	true	"Friend request ID"
+//	@Success		200
+//	@Router			/friends/requests/{id}/accept [post]
+func (h *Handler) AcceptRequest(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	requestID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request id"})
+		return
+	}
+
+	if err := h.service.AcceptRequest(userID, requestID); err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "friend request accepted"})
+}
+
+// RejectRequest godoc
+//
+//	@Summary		Reject friend request
+//	@Tags			Friend
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			id	path	int	true	"Friend request ID"
+//	@Success		200
+//	@Router			/friends/requests/{id}/reject [post]
+func (h *Handler) RejectRequest(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	requestID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request id"})
+		return
+	}
+
+	if err := h.service.RejectRequest(userID, requestID); err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "friend request rejected"})
+}
+
+// DeleteFriend godoc
+//
+//	@Summary		Unfriend
+//	@Tags			Friend
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			id	path	int	true	"Friend user ID"
+//	@Success		200
+//	@Router			/friends/{id} [delete]
+func (h *Handler) DeleteFriend(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	friendID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid friend id"})
+		return
+	}
+
+	if err := h.service.DeleteFriend(userID, friendID); err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "friend removed"})
+}
+
+// GetFriends godoc
+//
+//	@Summary		Get friend list
+//	@Tags			Friend
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Success		200	{array}	dto.FriendResponse
+//	@Router			/friends [get]
+func (h *Handler) GetFriends(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	friends, err := h.service.GetFriends(userID)
+	if err != nil {
+		logger.FromGin(c).Error("get friends error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	resp := make([]dto.FriendResponse, 0, len(friends))
+	for _, friend := range friends {
+		resp = append(resp, dto.FriendResponse{
+			ID:       friend.ID,
+			Provider: friend.Provider,
+			Account:  friend.Account,
+			Name:     friend.Name,
+			Avatar:   friend.Avatar,
+		})
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// GetReceivedRequests godoc
+//
+//	@Summary		Get received friend requests
+//	@Tags			Friend
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Success		200	{array}	dto.FriendRequestResponse
+//	@Router			/friends/requests/received [get]
+func (h *Handler) GetReceivedRequests(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	requests, err := h.service.GetReceivedRequests(userID)
+	if err != nil {
+		logger.FromGin(c).Error("get received requests error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	resp := make([]dto.FriendRequestResponse, 0, len(requests))
+	for _, request := range requests {
+		resp = append(resp, dto.FriendRequestResponse{
+			ID:         request.ID,
+			SenderID:   request.SenderID,
+			ReceiverID: request.ReceiverID,
+			Status:     request.Status,
+			CreatedAt:  request.CreatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// GetSentRequests godoc
+//
+//	@Summary		Get sent friend requests
+//	@Tags			Friend
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Success		200	{array}	dto.FriendRequestResponse
+//	@Router			/friends/requests/sent [get]
+func (h *Handler) GetSentRequests(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	requests, err := h.service.GetSentRequests(userID)
+	if err != nil {
+		logger.FromGin(c).Error("get sent requests error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	resp := make([]dto.FriendRequestResponse, 0, len(requests))
+	for _, request := range requests {
+		resp = append(resp, dto.FriendRequestResponse{
+			ID:         request.ID,
+			SenderID:   request.SenderID,
+			ReceiverID: request.ReceiverID,
+			Status:     request.Status,
+			CreatedAt:  request.CreatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *Handler) handleError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ErrCannotAddYourself):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot add yourself"})
+	case errors.Is(err, ErrUserNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+	case errors.Is(err, ErrAlreadyFriend):
+		c.JSON(http.StatusConflict, gin.H{"error": "already friend"})
+	case errors.Is(err, ErrRequestExists):
+		c.JSON(http.StatusConflict, gin.H{"error": "friend request already exists"})
+	case errors.Is(err, ErrRequestNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "friend request not found"})
+	case errors.Is(err, ErrForbidden):
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+	case errors.Is(err, ErrNotFriend):
+		c.JSON(http.StatusNotFound, gin.H{"error": "not friend"})
+	default:
+		logger.FromGin(c).Error("friend module error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+	}
+}
+
+====================================================================================================
+
+internal/modules/friend/module.go
+package friend
+
+import (
+	"gomess/internal/middleware"
+	"gomess/internal/modules"
+	"gomess/pkg/jwt"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Module struct {
+	handler HandlerInterface
+	jwt     jwt.JWTInterface
+}
+
+func NewModule(
+	ctx *modules.ModuleContext, 
+	repo RepositoryInterface,
+	userRepo UserRepositoryInterface, 
+	messageRepo MessageRepositoryInterface,
+) *Module {
+	service := NewService(repo, userRepo, messageRepo, ctx.DB)
+	handler := NewHandler(service)
+
+	return &Module{handler: handler, jwt: ctx.JWT}
+}
+
+func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
+	friends := rg.Group("/friends")
+
+	protected := friends.Group("/")
+	protected.Use(middleware.Auth(m.jwt))
+
+	protected.GET("", m.handler.GetFriends)
+	protected.DELETE("/:id", m.handler.DeleteFriend)
+
+	protected.POST("/requests", m.handler.SendRequest)
+	protected.GET("/requests/received", m.handler.GetReceivedRequests)
+	protected.GET("/requests/sent", m.handler.GetSentRequests)
+	protected.POST("/requests/:id/accept", m.handler.AcceptRequest)
+	protected.POST("/requests/:id/reject", m.handler.RejectRequest)
+}
+
+====================================================================================================
+
+internal/modules/friend/repository.go
+package friend
+
+import (
+	"database/sql"
+	"gomess/internal/database"
+	"gomess/internal/models"
+)
+
+type RepositoryInterface interface {
+	IsFriend(user1ID, user2ID int64) (bool, error)
+	FindPendingRequest(senderID, receiverID int64) (*models.FriendRequest, error)
+	CreateRequest(request *models.FriendRequest) error
+	GetReceivedRequests(userID int64) ([]models.FriendRequest, error)
+	GetSentRequests(userID int64) ([]models.FriendRequest, error)
+	GetRequestByID(id int64) (*models.FriendRequest, error)
+	UpdateRequestStatus(id int64, status string) error
+	CreateFriend(user1ID, user2ID int64) error
+	DeleteFriend(user1ID, user2ID int64) error
+	GetFriends(userID int64) ([]models.User, error)
+
+	// Transaction
+	UpdateRequestStatusTx(tx *sql.Tx, id int64, status string) error
+	CreateFriendTx(tx *sql.Tx, user1ID, user2ID int64) error
+	DeleteFriendTx(tx *sql.Tx, user1ID, user2ID int64) error
+}
+
+type Repository struct {
+	db database.DatabaseInterface
+}
+
+func NewRepository(db database.DatabaseInterface) *Repository {
+	return &Repository{db: db}
+}
+
+func (r *Repository) IsFriend(user1ID, user2ID int64) (bool, error) {
+	if user1ID > user2ID {
+		user1ID, user2ID = user2ID, user1ID
+	}
+
+	query := `
+	SELECT EXISTS(
+		SELECT 1
+		FROM friends
+		WHERE user1_id = ? AND user2_id = ?
+	)
+	`
+
+	var exists bool
+	err := r.db.GetDB().QueryRow(query, user1ID, user2ID).Scan(&exists)
+
+	return exists, err
+}
+
+func (r *Repository) FindPendingRequest(senderID, receiverID int64) (*models.FriendRequest, error) {
+	query := `
+	SELECT
+		id, sender_id, receiver_id, status, created_at, updated_at
+	FROM friend_requests
+	WHERE (
+		(sender_id = ? AND receiver_id = ?)
+		OR (sender_id = ? AND receiver_id = ?)
+	) AND status = 'pending'
+	LIMIT 1
+	`
+
+	row := r.db.GetDB().QueryRow(query, senderID, receiverID, receiverID, senderID)
+	var req models.FriendRequest
+	err := row.Scan(
+		&req.ID,
+		&req.SenderID,
+		&req.ReceiverID,
+		&req.Status,
+		&req.CreatedAt,
+		&req.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &req, nil
+}
+
+func (r *Repository) CreateRequest(request *models.FriendRequest) error {
+	query := `
+	INSERT INTO friend_requests (sender_id, receiver_id, status)
+	VALUES (?, ?, ?)
+	`
+	result, err := r.db.GetDB().Exec(query, request.SenderID, request.ReceiverID, request.Status)
+
+	if err != nil {
+		return err
+	}
+
+	id, _ := result.LastInsertId()
+	request.ID = id
+	return nil
+}
+
+func (r *Repository) GetReceivedRequests(userID int64) ([]models.FriendRequest, error) {
+	query := `
+	SELECT id, sender_id, receiver_id, status, created_at, updated_at
+	FROM friend_requests
+	WHERE receiver_id = ?
+	`
+	rows, err := r.db.GetDB().Query(query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	requests := make([]models.FriendRequest, 0)
+
+	for rows.Next() {
+		var req models.FriendRequest
+		err := rows.Scan(
+			&req.ID,
+			&req.SenderID,
+			&req.ReceiverID,
+			&req.Status,
+			&req.CreatedAt,
+			&req.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, req)
+	}
+	return requests, nil
+}
+
+func (r *Repository) GetSentRequests(userID int64) ([]models.FriendRequest, error) {
+	query := `
+	SELECT id, sender_id, receiver_id, status, created_at, updated_at
+	FROM friend_requests
+	WHERE sender_id = ?
+	`
+	rows, err := r.db.GetDB().Query(query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	requests := make([]models.FriendRequest, 0)
+
+	for rows.Next() {
+		var req models.FriendRequest
+		err := rows.Scan(
+			&req.ID,
+			&req.SenderID,
+			&req.ReceiverID,
+			&req.Status,
+			&req.CreatedAt,
+			&req.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, req)
+	}
+	return requests, nil
+}
+
+func (r *Repository) GetRequestByID(id int64) (*models.FriendRequest, error) {
+	query := `
+	SELECT id, sender_id, receiver_id, status, created_at, updated_at
+	FROM friend_requests
+	WHERE id = ?
+	LIMIT 1
+	`
+	row := r.db.GetDB().QueryRow(query, id)
+	var req models.FriendRequest
+	err := row.Scan(
+		&req.ID,
+		&req.SenderID,
+		&req.ReceiverID,
+		&req.Status,
+		&req.CreatedAt,
+		&req.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+func (r *Repository) UpdateRequestStatus(id int64, status string) error {
+	query := `
+	UPDATE friend_requests
+	SET status = ?
+	WHERE id = ?
+	`
+	_, err := r.db.GetDB().Exec(query, status, id)
+	return err
+}
+
+func (r *Repository) CreateFriend(user1ID, user2ID int64) error {
+	if user1ID > user2ID {
+		user1ID, user2ID = user2ID, user1ID
+	}
+
+	query := `
+	INSERT INTO friends(user1_id, user2_id)
+	VALUES(?, ?)
+	`
+
+	_, err := r.db.GetDB().Exec(query, user1ID, user2ID)
+	return err
+}
+
+func (r *Repository) DeleteFriend(user1ID, user2ID int64) error {
+	if user1ID > user2ID {
+		user1ID, user2ID = user2ID, user1ID
+	}
+
+	query := `
+	DELETE FROM friends
+	WHERE user1_id = ? AND user2_id = ?
+	`
+
+	_, err := r.db.GetDB().Exec(query, user1ID, user2ID)
+	return err
+}
+
+func (r *Repository) GetFriends(userID int64) ([]models.User, error) {
+	query := `
+	SELECT u.id, u.provider, u.provider_id, u.account, u.name, u.avatar
+	FROM friends f
+	JOIN users u 
+	ON u.id = 
+		CASE
+			WHEN f.user1_id = ? THEN f.user2_id ELSE f.user1_id
+		END
+	WHERE f.user1_id = ? OR f.user2_id = ?
+	ORDER BY u.name
+	`
+
+	rows, err := r.db.GetDB().Query(query, userID, userID, userID)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	users := make([]models.User, 0)
+
+	for rows.Next() {
+		var user models.User
+		err := rows.Scan(
+			&user.ID,
+			&user.Provider,
+			&user.ProviderID,
+			&user.Account,
+			&user.Name,
+			&user.Avatar,
+		)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, nil
+}
+
+func (r *Repository) UpdateRequestStatusTx(tx *sql.Tx, id int64, status string) error {
+	query := `
+	UPDATE friend_requests
+	SET status = ?
+	WHERE id = ?
+	`
+
+	_, err := tx.Exec(query, status, id)
+	return err
+}
+
+func (r *Repository) CreateFriendTx(tx *sql.Tx, user1ID, user2ID int64) error {
+	if user1ID > user2ID {
+		user1ID, user2ID = user2ID, user1ID
+	}
+	
+	query := `
+	INSERT INTO friends(user1_id, user2_id)
+	VALUES(?, ?)
+	`
+	_, err := tx.Exec(query, user1ID, user2ID)
+	return err
+}
+
+func (r *Repository) DeleteFriendTx(tx *sql.Tx, user1ID, user2ID int64) error {
+	if user1ID > user2ID {
+		user1ID, user2ID = user2ID, user1ID
+	}
+
+	query := `
+	DELETE FROM friends
+	WHERE user1_id = ? AND user2_id = ?
+	`
+
+	_, err := tx.Exec(query, user1ID, user2ID)
+	return err
+}
+
+====================================================================================================
+
+internal/modules/friend/service.go
+package friend
+
+import (
+	"database/sql"
+	"gomess/internal/database"
+	"gomess/internal/models"
+)
+
+type UserRepositoryInterface interface {
+	ExistsUser(userID int64) (bool, error)
+}
+
+type MessageRepositoryInterface interface {
+	DeleteConversationTx(tx *sql.Tx, user1ID, user2ID int64) error
+}
+
+type ServiceInterface interface {
+	SendRequest(senderID, receiverID int64) error
+	AcceptRequest(userID, requestID int64) error
+	RejectRequest(userID, requestID int64) error
+	DeleteFriend(userID, friendID int64) error
+	GetFriends(userID int64) ([]models.User, error)
+	GetReceivedRequests(userID int64) ([]models.FriendRequest, error)
+	GetSentRequests(userID int64) ([]models.FriendRequest, error)
+}
+
+type Service struct {
+	repository  RepositoryInterface
+	userRepo    UserRepositoryInterface
+	messageRepo MessageRepositoryInterface
+	db          database.DatabaseInterface
+}
+
+func NewService(
+	repository RepositoryInterface,
+	userRepo UserRepositoryInterface,
+	messageRepo MessageRepositoryInterface,
+	db database.DatabaseInterface,
+) *Service {
+	return &Service{
+		repository:  repository,
+		userRepo:    userRepo,
+		messageRepo: messageRepo,
+		db:          db,
+	}
+}
+
+func (s *Service) SendRequest(senderID, receiverID int64) error {
+	if senderID == receiverID {
+		return ErrCannotAddYourself
+	}
+
+	exists, err := s.userRepo.ExistsUser(receiverID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrUserNotFound
+	}
+
+	isFriend, err := s.repository.IsFriend(senderID, receiverID)
+	if err != nil {
+		return err
+	}
+	if isFriend {
+		return ErrAlreadyFriend
+	}
+
+	existing, err := s.repository.FindPendingRequest(senderID, receiverID)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if existing.SenderID == receiverID {
+			return s.db.WithTransaction(func(tx *sql.Tx) error {
+				if err := s.repository.UpdateRequestStatusTx(tx, existing.ID, RequestAccepted); err != nil {
+					return err
+				}
+				return s.repository.CreateFriendTx(tx, existing.SenderID, existing.ReceiverID)
+			})
+		}
+		return ErrRequestExists
+	}
+
+	request := &models.FriendRequest{
+		SenderID:   senderID,
+		ReceiverID: receiverID,
+		Status:     RequestPending,
+	}
+
+	return s.repository.CreateRequest(request)
+}
+
+func (s *Service) AcceptRequest(userID, requestID int64) error {
+	request, err := s.repository.GetRequestByID(requestID)
+	if err != nil {
+		return err
+	}
+	if request == nil {
+		return ErrRequestNotFound
+	}
+	if request.ReceiverID != userID {
+		return ErrForbidden
+	}
+	if request.Status != RequestPending {
+		return ErrRequestNotFound
+	}
+
+	return s.db.WithTransaction(func(tx *sql.Tx) error {
+		if err := s.repository.UpdateRequestStatusTx(tx, request.ID, RequestAccepted); err != nil {
+			return err
+		}
+		return s.repository.CreateFriendTx(tx, request.SenderID, request.ReceiverID)
+	})
+}
+
+func (s *Service) RejectRequest(userID, requestID int64) error {
+	request, err := s.repository.GetRequestByID(requestID)
+	if err != nil {
+		return err
+	}
+	if request == nil {
+		return ErrRequestNotFound
+	}
+	if request.ReceiverID != userID {
+		return ErrForbidden
+	}
+	if request.Status != RequestPending {
+		return ErrRequestNotFound
+	}
+
+	return s.repository.UpdateRequestStatus(request.ID, RequestRejected)
+}
+
+func (s *Service) DeleteFriend(userID, friendID int64) error {
+	if userID == friendID {
+		return ErrCannotAddYourself
+	}
+
+	isFriend, err := s.repository.IsFriend(userID, friendID)
+	if err != nil {
+		return err
+	}
+	if !isFriend {
+		return ErrNotFriend
+	}
+
+	return s.db.WithTransaction(func(tx *sql.Tx) error {
+		if err := s.messageRepo.DeleteConversationTx(tx, userID, friendID); err != nil {
+			return err
+		}
+		return s.repository.DeleteFriendTx(tx, userID, friendID)
+	})
+}
+
+func (s *Service) GetFriends(userID int64) ([]models.User, error) {
+	return s.repository.GetFriends(userID)
+}
+
+func (s *Service) GetReceivedRequests(userID int64) ([]models.FriendRequest, error) {
+	return s.repository.GetReceivedRequests(userID)
+}
+
+func (s *Service) GetSentRequests(userID int64) ([]models.FriendRequest, error) {
+	return s.repository.GetSentRequests(userID)
+}
+
+====================================================================================================
+
+internal/modules/message/const.go
+package message
+
+import "time"
+
+const (
+	defaultHistoryLimit      = 20
+	maxHistoryLimit          = 100
+	maxAttachmentsPerMessage = 10
+	presignGetExpiry         = 15 * time.Minute
+	revokeWindow             = 15 * time.Minute
+	eventNewMessage          = "message.new"
+	eventMessageDeleted      = "message.deleted"
+	eventMessageRevoked      = "message.revoked"
+)
+
+====================================================================================================
+
+internal/modules/message/dto/message_response.go
+package dto
+
+import "time"
+
+type AttachmentResponse struct {
+	ID        int64  `json:"id"`
+	Type      string `json:"type"`
+	URL       string `json:"url"`
+	FileName  string `json:"file_name"`
+	MimeType  string `json:"mime_type"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+type MessageResponse struct {
+	ID          int64                `json:"id"`
+	SenderID    int64                `json:"sender_id"`
+	ReceiverID  int64                `json:"receiver_id"`
+	Content     string               `json:"content"`
+	Attachments []AttachmentResponse `json:"attachments"`
+	CreatedAt   time.Time            `json:"created_at"`
+	Revoked     bool                 `json:"revoked"`
+}
+
+====================================================================================================
+
+internal/modules/message/dto/send_message_request.go
+package dto
+
+type AttachmentInput struct {
+	ObjectKey string `json:"object_key" binding:"required"`
+	FileName  string `json:"file_name" binding:"required"`
+}
+
+type SendMessageRequest struct {
+	ReceiverID  int64             `json:"receiver_id" binding:"required"`
+	Content     string            `json:"content" binding:"max=2000"`
+	Attachments []AttachmentInput `json:"attachments" binding:"max=10,dive"`
+}
+
+====================================================================================================
+
+internal/modules/message/errors.go
+package message
+
+import "errors"
+
+var (
+	ErrNotFriend             = errors.New("not friend")
+	ErrCannotMessageYourself = errors.New("cannot send message to yourself")
+	ErrEmptyMessage          = errors.New("message must have content or at least one attachment")
+	ErrAttachmentNotFound    = errors.New("attachment not uploaded yet")
+	ErrTooManyAttachments    = errors.New("too many attachments")
+	ErrMessageNotFound     = errors.New("message not found")
+	ErrForbidden           = errors.New("forbidden")
+	ErrAlreadyRevoked      = errors.New("message already revoked")
+	ErrRevokeWindowExpired = errors.New("revoke window expired")
+)
+
+====================================================================================================
+
+internal/modules/message/handler.go
+package message
+
+import (
+	"errors"
+	"gomess/internal/context"
+	"gomess/internal/logger"
+	"gomess/internal/modules/message/dto"
+	"net/http"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+)
+
+type HandlerInterface interface {
+	SendMessage(c *gin.Context)
+	GetHistory(c *gin.Context)
+	DeleteForMe(c *gin.Context)
+	RevokeMessage(c *gin.Context)
+}
+
+type Handler struct {
+	service ServiceInterface
+}
+
+func NewHandler(service ServiceInterface) *Handler {
+	return &Handler{service: service}
+}
+
+// SendMessage godoc
+//
+//	@Summary		Send a message
+//	@Description	Send a message to a friend (only friends can message each other)
+//	@Tags			Message
+//	@Accept			json
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			request	body		dto.SendMessageRequest	true	"Message"
+//	@Success		201		{object}	dto.MessageResponse
+//	@Router			/messages [post]
+func (h *Handler) SendMessage(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	var req dto.SendMessageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	message, err := h.service.SendMessage(userID, req.ReceiverID, req.Content, req.Attachments)
+	if err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, message)
+}
+
+// GetHistory godoc
+//
+//	@Summary		Get message history with a friend
+//	@Tags			Message
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			friendId	path	int	true	"Friend user ID"
+//	@Param			before_id	query	int	false	"Get messages older than this ID"
+//	@Param			limit		query	int	false	"Limit (default 20, max 100)"
+//	@Success		200			{array}	dto.MessageResponse
+//	@Router			/messages/{friendId} [get]
+func (h *Handler) GetHistory(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	friendID, err := strconv.ParseInt(c.Param("friendId"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid friend id"})
+		return
+	}
+
+	beforeID, _ := strconv.ParseInt(c.Query("before_id"), 10, 64)
+	limit, _ := strconv.Atoi(c.Query("limit"))
+
+	messages, err := h.service.GetHistory(userID, friendID, beforeID, limit)
+	if err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, messages)
+}
+
+// DeleteForMe godoc
+//
+//	@Summary		Delete a message for myself only
+//	@Tags			Message
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			id	path	int	true	"Message ID"
+//	@Success		200
+//	@Router			/messages/{id} [delete]
+func (h *Handler) DeleteForMe(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	messageID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid message id"})
+		return
+	}
+
+	if err := h.service.DeleteForMe(userID, messageID); err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "message deleted"})
+}
+
+// RevokeMessage godoc
+//
+//	@Summary		Revoke a message for everyone
+//	@Tags			Message
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			id	path	int	true	"Message ID"
+//	@Success		200
+//	@Router			/messages/{id}/revoke [post]
+func (h *Handler) RevokeMessage(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	messageID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid message id"})
+		return
+	}
+
+	if err := h.service.RevokeMessage(userID, messageID); err != nil {
+		h.handleError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "message revoked"})
+}
+
+func (h *Handler) handleError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ErrNotFriend):
+		c.JSON(http.StatusForbidden, gin.H{"error": "you can only message friends"})
+	case errors.Is(err, ErrCannotMessageYourself):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot send message to yourself"})
+	case errors.Is(err, ErrEmptyMessage):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "message must have content or at least one attachment"})
+	case errors.Is(err, ErrTooManyAttachments):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many attachments"})
+	case errors.Is(err, ErrAttachmentNotFound):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "one or more attachments were not uploaded"})
+	case errors.Is(err, ErrMessageNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+	case errors.Is(err, ErrForbidden):
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+	case errors.Is(err, ErrAlreadyRevoked):
+		c.JSON(http.StatusConflict, gin.H{"error": "message already revoked"})
+	case errors.Is(err, ErrRevokeWindowExpired):
+		c.JSON(http.StatusBadRequest, gin.H{"error": "revoke window expired"})
+	default:
+		logger.FromGin(c).Error("message module error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+	}
+}
+
+====================================================================================================
+
+internal/modules/message/module.go
+package message
+
+import (
+	"gomess/internal/middleware"
+	"gomess/internal/modules"
+	"gomess/pkg/jwt"
+	"gomess/pkg/storage"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Module struct {
+	handler HandlerInterface
+	jwt     jwt.JWTInterface
+}
+
+func NewModule(
+	ctx *modules.ModuleContext, 
+	friendRepo FriendRepositoryInterface, 
+	storage storage.StorageInterface,
+	broadcaster Broadcaster,
+) *Module {
+	repo := NewRepository(ctx.DB)
+	service := NewService(repo, friendRepo, storage, ctx.DB, broadcaster)
+	handler := NewHandler(service)
+
+	return &Module{handler: handler, jwt: ctx.JWT}
+}
+
+func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
+	messages := rg.Group("/messages")
+
+	protected := messages.Group("")
+	protected.Use(middleware.Auth(m.jwt))
+
+	protected.POST("", m.handler.SendMessage)
+	protected.GET("/:friendId", m.handler.GetHistory)
+	protected.DELETE("/:id", m.handler.DeleteForMe)
+	protected.POST("/:id/revoke", m.handler.RevokeMessage)
+}
+
+====================================================================================================
+
+internal/modules/message/repository.go
+package message
+
+import (
+	"database/sql"
+	"gomess/internal/database"
+	"gomess/internal/models"
+	"strings"
+)
+
+type RepositoryInterface interface {
+	GetByID(id int64) (*models.Message, error)
+	GetHistory(userID, friendID int64, beforeID int64, limit int) ([]models.Message, error)
+	GetAttachmentsByMessageIDs(messageIDs []int64) (map[int64][]models.MessageAttachment, error)
+	CreateDeletion(messageID, userID int64) error
+	RevokeMessage(id int64) error
+	GetAllObjectKeys() ([]string, error)
+
+	// Transaction
+	CreateTx(tx *sql.Tx, message *models.Message) error
+	CreateAttachmentsTx(tx *sql.Tx, messageID int64, attachments []models.MessageAttachment) error
+	DeleteConversationTx(tx *sql.Tx, user1ID, user2ID int64) error
+}
+
+type Repository struct {
+	db database.DatabaseInterface
+}
+
+func NewRepository(db database.DatabaseInterface) *Repository {
+	return &Repository{db: db}
+}
+
+func (r *Repository) GetByID(id int64) (*models.Message, error) {
+	query := `
+	SELECT id, sender_id, receiver_id, content, created_at, revoked_at
+	FROM messages
+	WHERE id = ?
+	LIMIT 1
+	`
+
+	var m models.Message
+	err := r.db.GetDB().QueryRow(query, id).Scan(
+		&m.ID, &m.SenderID, &m.ReceiverID, &m.Content, &m.CreatedAt, &m.RevokedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &m, nil
+}
+
+func (r *Repository) GetHistory(userID, friendID int64, beforeID int64, limit int) ([]models.Message, error) {
+	query := `
+	SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, m.revoked_at
+	FROM messages m
+	WHERE (
+		(m.sender_id = ? AND m.receiver_id = ?)
+		OR (m.sender_id = ? AND m.receiver_id = ?)
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM message_deletions d
+		WHERE d.message_id = m.id AND d.user_id = ?
+	)
+	`
+
+	args := []any{userID, friendID, friendID, userID, userID}
+
+	if beforeID > 0 {
+		query += " AND m.id < ?"
+		args = append(args, beforeID)
+	}
+
+	query += " ORDER BY m.id DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := r.db.GetDB().Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	messages := make([]models.Message, 0, limit)
+
+	for rows.Next() {
+		var m models.Message
+		if err := rows.Scan(&m.ID, &m.SenderID, &m.ReceiverID, &m.Content, &m.CreatedAt, &m.RevokedAt); err != nil {
+			return nil, err
+		}
+		messages = append(messages, m)
+	}
+
+	return messages, nil
+}
+
+func (r *Repository) GetAttachmentsByMessageIDs(messageIDs []int64) (map[int64][]models.MessageAttachment, error) {
+	result := make(map[int64][]models.MessageAttachment)
+
+	if len(messageIDs) == 0 {
+		return result, nil
+	}
+
+	placeholders := make([]string, len(messageIDs))
+	args := make([]any, len(messageIDs))
+	for i, id := range messageIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := `
+	SELECT id, message_id, type, object_key, file_name, mime_type, size_bytes, created_at
+	FROM message_attachments
+	WHERE message_id IN (` + strings.Join(placeholders, ",") + `)
+	`
+
+	rows, err := r.db.GetDB().Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a models.MessageAttachment
+		err := rows.Scan(
+			&a.ID, &a.MessageID, &a.Type, &a.ObjectKey,
+			&a.FileName, &a.MimeType, &a.SizeBytes, &a.CreatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		result[a.MessageID] = append(result[a.MessageID], a)
+	}
+
+	return result, nil
+}
+
+func (r *Repository) CreateDeletion(messageID, userID int64) error {
+	query := `
+	INSERT IGNORE INTO message_deletions (message_id, user_id)
+	VALUES (?, ?)
+	`
+	_, err := r.db.GetDB().Exec(query, messageID, userID)
+	return err
+}
+
+func (r *Repository) RevokeMessage(id int64) error {
+	query := `
+	UPDATE messages
+	SET revoked_at = CURRENT_TIMESTAMP
+	WHERE id = ?
+	`
+	_, err := r.db.GetDB().Exec(query, id)
+	return err
+}
+
+func (r *Repository) GetAllObjectKeys() ([]string, error) {
+	query := `SELECT object_key FROM message_attachments`
+
+	rows, err := r.db.GetDB().Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+
+	return keys, nil
+}
+
+func (r *Repository) CreateTx(tx *sql.Tx, message *models.Message) error {
+	query := `
+	INSERT INTO messages (sender_id, receiver_id, content)
+	VALUES (?, ?, ?)
+	`
+
+	result, err := tx.Exec(query, message.SenderID, message.ReceiverID, message.Content)
+	if err != nil {
+		return err
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return err
+	}
+	message.ID = id
+
+	return nil
+}
+
+func (r *Repository) CreateAttachmentsTx(tx *sql.Tx, messageID int64, attachments []models.MessageAttachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+
+	query := `
+	INSERT INTO message_attachments (message_id, type, object_key, file_name, mime_type, size_bytes)
+	VALUES (?, ?, ?, ?, ?, ?)
+	`
+
+	stmt, err := tx.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, a := range attachments {
+		if _, err := stmt.Exec(messageID, a.Type, a.ObjectKey, a.FileName, a.MimeType, a.SizeBytes); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+/// TODO: Delete trash files in file storage. Need job/event in cmd/worker
+func (r *Repository) DeleteConversationTx(tx *sql.Tx, user1ID, user2ID int64) error {
+	query := `
+	DELETE FROM messages
+	WHERE (sender_id = ? AND receiver_id = ?)
+	   OR (sender_id = ? AND receiver_id = ?)
+	`
+	_, err := tx.Exec(query, user1ID, user2ID, user2ID, user1ID)
+	return err
+}
+
+====================================================================================================
+
+internal/modules/message/service.go
+package message
+
+import (
+	"context"
+	"database/sql"
+	"gomess/internal/database"
+	"gomess/internal/models"
+	"gomess/internal/modules/message/dto"
+	"gomess/pkg/storage"
+	"strings"
+	"time"
+)
+
+type FriendRepositoryInterface interface {
+	IsFriend(user1ID, user2ID int64) (bool, error)
+}
+
+type Broadcaster interface {
+	SendToUser(userID int64, event string, data any)
+}
+
+type ServiceInterface interface {
+	SendMessage(senderID, receiverID int64, content string, attachments []dto.AttachmentInput) (*dto.MessageResponse, error)
+	GetHistory(userID, friendID int64, beforeID int64, limit int) ([]dto.MessageResponse, error)
+	DeleteForMe(userID, messageID int64) error
+	RevokeMessage(userID, messageID int64) error
+}
+
+type Service struct {
+	repo        RepositoryInterface
+	friendRepo  FriendRepositoryInterface
+	storage     storage.StorageInterface
+	db          database.DatabaseInterface
+	broadcaster Broadcaster
+}
+
+func NewService(
+	repo RepositoryInterface,
+	friendRepo FriendRepositoryInterface,
+	storage storage.StorageInterface,
+	db database.DatabaseInterface,
+	broadcaster Broadcaster,
+) *Service {
+	return &Service{
+		repo:        repo,
+		friendRepo:  friendRepo,
+		storage:     storage,
+		db:          db,
+		broadcaster: broadcaster,
+	}
+}
+
+func (s *Service) SendMessage(senderID, receiverID int64, content string, attachments []dto.AttachmentInput) (*dto.MessageResponse, error) {
+	if senderID == receiverID {
+		return nil, ErrCannotMessageYourself
+	}
+
+	if content == "" && len(attachments) == 0 {
+		return nil, ErrEmptyMessage
+	}
+
+	if len(attachments) > maxAttachmentsPerMessage {
+		return nil, ErrTooManyAttachments
+	}
+
+	isFriend, err := s.friendRepo.IsFriend(senderID, receiverID)
+	if err != nil {
+		return nil, err
+	}
+	if !isFriend {
+		return nil, ErrNotFriend
+	}
+
+	messageAttachments := make([]models.MessageAttachment, 0, len(attachments))
+	for _, a := range attachments {
+		info, err := s.storage.StatObject(context.Background(), a.ObjectKey)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Exists {
+			return nil, ErrAttachmentNotFound
+		}
+
+		messageAttachments = append(messageAttachments, models.MessageAttachment{
+			Type:      detectAttachmentType(info.ContentType),
+			ObjectKey: a.ObjectKey,
+			FileName:  a.FileName,
+			MimeType:  info.ContentType,
+			SizeBytes: info.SizeBytes,
+		})
+	}
+
+	message := &models.Message{
+		SenderID:   senderID,
+		ReceiverID: receiverID,
+		Content:    content,
+	}
+
+	err = s.db.WithTransaction(func(tx *sql.Tx) error {
+		if err := s.repo.CreateTx(tx, message); err != nil {
+			return err
+		}
+		return s.repo.CreateAttachmentsTx(tx, message.ID, messageAttachments)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	message.Attachments = messageAttachments
+
+	resp, err := s.toMessageResponse(message)
+	if err != nil {
+		return nil, err
+	}
+
+	s.broadcaster.SendToUser(receiverID, eventNewMessage, resp)
+	s.broadcaster.SendToUser(senderID, eventNewMessage, resp)
+
+	return resp, nil
+}
+
+func (s *Service) GetHistory(userID, friendID int64, beforeID int64, limit int) ([]dto.MessageResponse, error) {
+	isFriend, err := s.friendRepo.IsFriend(userID, friendID)
+	if err != nil {
+		return nil, err
+	}
+	if !isFriend {
+		return nil, ErrNotFriend
+	}
+
+	if limit <= 0 {
+		limit = defaultHistoryLimit
+	}
+	if limit > maxHistoryLimit {
+		limit = maxHistoryLimit
+	}
+
+	messages, err := s.repo.GetHistory(userID, friendID, beforeID, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	messageIDs := make([]int64, len(messages))
+	for i, m := range messages {
+		messageIDs[i] = m.ID
+	}
+
+	attachmentsByMessage, err := s.repo.GetAttachmentsByMessageIDs(messageIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := make([]dto.MessageResponse, 0, len(messages))
+	for _, m := range messages {
+		m.Attachments = attachmentsByMessage[m.ID]
+
+		r, err := s.toMessageResponse(&m)
+		if err != nil {
+			return nil, err
+		}
+		resp = append(resp, *r)
+	}
+
+	return resp, nil
+}
+
+func (s *Service) DeleteForMe(userID, messageID int64) error {
+	message, err := s.repo.GetByID(messageID)
+	if err != nil {
+		return err
+	}
+	if message == nil {
+		return ErrMessageNotFound
+	}
+	if message.SenderID != userID && message.ReceiverID != userID {
+		return ErrForbidden
+	}
+
+	if err := s.repo.CreateDeletion(messageID, userID); err != nil {
+		return err
+	}
+
+	s.broadcaster.SendToUser(userID, eventMessageDeleted, map[string]int64{"id": messageID})
+
+	return nil
+}
+
+func (s *Service) RevokeMessage(userID, messageID int64) error {
+	message, err := s.repo.GetByID(messageID)
+	if err != nil {
+		return err
+	}
+	if message == nil {
+		return ErrMessageNotFound
+	}
+	if message.SenderID != userID {
+		return ErrForbidden
+	}
+	if message.RevokedAt != nil {
+		return ErrAlreadyRevoked
+	}
+	if time.Since(message.CreatedAt) > revokeWindow {
+		return ErrRevokeWindowExpired
+	}
+
+	if err := s.repo.RevokeMessage(messageID); err != nil {
+		return err
+	}
+
+	payload := map[string]int64{
+		"id": messageID, "sender_id": message.SenderID, "receiver_id": message.ReceiverID,
+	}
+	s.broadcaster.SendToUser(message.SenderID, eventMessageRevoked, payload)
+	s.broadcaster.SendToUser(message.ReceiverID, eventMessageRevoked, payload)
+
+	return nil
+}
+
+func (s *Service) toMessageResponse(m *models.Message) (*dto.MessageResponse, error) {
+	if m.RevokedAt != nil {
+		return &dto.MessageResponse{
+			ID:         m.ID,
+			SenderID:   m.SenderID,
+			ReceiverID: m.ReceiverID,
+			Revoked:    true,
+			CreatedAt:  m.CreatedAt,
+		}, nil
+	}
+
+	attachments := make([]dto.AttachmentResponse, 0, len(m.Attachments))
+	for _, a := range m.Attachments {
+		url, err := s.storage.PresignedGetURL(context.Background(), a.ObjectKey, presignGetExpiry)
+		if err != nil {
+			return nil, err
+		}
+
+		attachments = append(attachments, dto.AttachmentResponse{
+			ID:        a.ID,
+			Type:      a.Type,
+			URL:       url,
+			FileName:  a.FileName,
+			MimeType:  a.MimeType,
+			SizeBytes: a.SizeBytes,
+		})
+	}
+
+	return &dto.MessageResponse{
+		ID:          m.ID,
+		SenderID:    m.SenderID,
+		ReceiverID:  m.ReceiverID,
+		Content:     m.Content,
+		Attachments: attachments,
+		Revoked:     false,
+		CreatedAt:   m.CreatedAt,
+	}, nil
+}
+
+func detectAttachmentType(mimeType string) string {
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		return "image"
+	case strings.HasPrefix(mimeType, "video/"):
+		return "video"
+	case strings.HasPrefix(mimeType, "audio/"):
+		return "audio"
+	default:
+		return "file"
+	}
+}
+
+====================================================================================================
+
+internal/modules/module.go
+package modules
+
+import (
+	"gomess/internal/config"
+	"gomess/internal/database"
+	"gomess/internal/redis"
+	"gomess/pkg/jwt"
+
+	"github.com/gin-gonic/gin"
+)
+
+type ModuleInterface interface {
+	RegisterRoutes(rg *gin.RouterGroup)
+}
+
+type ModuleContext struct {
+	DB    database.DatabaseInterface
+	JWT   jwt.JWTInterface
+	Cfg   config.ConfigInterface
+	Redis redis.RedisInterface
+	
+}
+
+====================================================================================================
+
+internal/modules/upload/const.go
+package upload
+
+import "time"
+
+const (
+	presignPutExpiry = 5 * time.Minute
+)
+
+====================================================================================================
+
+internal/modules/upload/dto/presign_request.go
+package dto
+
+type PresignRequest struct {
+	FileName string `json:"file_name" binding:"required"`
+}
+
+====================================================================================================
+
+internal/modules/upload/dto/presign_response.go
+package dto
+
+type PresignResponse struct {
+	ObjectKey string `json:"object_key"`
+	UploadURL string `json:"upload_url"`
+}
+
+====================================================================================================
+
+internal/modules/upload/handler.go
+package upload
+
+import (
+	"gomess/internal/context"
+	"gomess/internal/logger"
+	"gomess/internal/modules/upload/dto"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+type HandlerInterface interface {
+	Presign(c *gin.Context)
+}
+
+type Handler struct {
+	service ServiceInterface
+}
+
+func NewHandler(service ServiceInterface) *Handler {
+	return &Handler{service: service}
+}
+
+// Presign godoc
+//
+//	@Summary		Get presigned upload URL
+//	@Description	Get a short-lived URL to upload a file directly to object storage
+//	@Tags			Upload
+//	@Accept			json
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			request	body		dto.PresignRequest	true	"File info"
+//	@Success		200		{object}	dto.PresignResponse
+//	@Router			/uploads/presign [post]
+func (h *Handler) Presign(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	var req dto.PresignRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	result, err := h.service.PresignUpload(userID, req.FileName)
+	if err != nil {
+		logger.FromGin(c).Error("presign upload error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+====================================================================================================
+
+internal/modules/upload/module.go
+package upload
+
+import (
+	"gomess/internal/middleware"
+	"gomess/internal/modules"
+	"gomess/pkg/jwt"
+	"gomess/pkg/storage"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Module struct {
+	handler HandlerInterface
+	jwt     jwt.JWTInterface
+}
+
+func NewModule(ctx *modules.ModuleContext, storage storage.StorageInterface) *Module {
+	service := NewService(storage)
+	handler := NewHandler(service)
+
+	return &Module{handler: handler, jwt: ctx.JWT}
+}
+
+func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
+	uploads := rg.Group("/uploads")
+	uploads.Use(middleware.Auth(m.jwt))
+
+	uploads.POST("/presign", m.handler.Presign)
+}
+
+====================================================================================================
+
+internal/modules/upload/service.go
+package upload
+
+import (
+	"context"
+	"gomess/internal/modules/upload/dto"
+	"gomess/pkg/storage"
+	"path/filepath"
+	"strconv"
+
+	"github.com/google/uuid"
+)
+
+type ServiceInterface interface {
+	PresignUpload(userID int64, fileName string) (*dto.PresignResponse, error)
+}
+
+type Service struct {
+	storage storage.StorageInterface
+}
+
+func NewService(storage storage.StorageInterface) *Service {
+	return &Service{storage: storage}
+}
+
+func (s *Service) PresignUpload(userID int64, fileName string) (*dto.PresignResponse, error) {
+	ext := filepath.Ext(fileName)
+	if len(ext) > 10 {
+		ext = ""
+	}
+
+	objectKey := "attachments/" + strconv.FormatInt(userID, 10) + "/" + uuid.NewString() + ext
+
+	uploadURL, err := s.storage.PresignedPutURL(context.Background(), objectKey, presignPutExpiry)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dto.PresignResponse{
+		UploadURL: uploadURL,
+		ObjectKey: objectKey,
+	}, nil
+}
+
+====================================================================================================
+
+internal/modules/user/dto/delete_me_request.go
+package dto
+
+type DeleteMeRequest struct {
+	Confirm bool `json:"confirm" binding:"required"`
+}
+
+====================================================================================================
+
+internal/modules/user/dto/get_me_response.go
+package dto
+
+type GetMeResponse struct {
+	ID      int64  `json:"id"`
+	Account string `json:"account"`
+	Name    string `json:"name"`
+	Avatar  string `json:"avatar"`
+}
+
+====================================================================================================
+
+internal/modules/user/dto/search_request.go
+package dto
+
+type SearchRequest struct {
+	Provider string `form:"provider" binding:"required"`
+	Keyword  string `form:"keyword" binding:"required"`
+	Skip     int    `form:"skip"`
+	Limit    int    `form:"limit"`
+}
+
+====================================================================================================
+
+internal/modules/user/dto/search_response.go
+package dto
+
+type SearchResponse struct {
+	ID       int64  `json:"id"`
+	Provider string `json:"provider"`
+	Account  string `json:"account"`
+	Name     string `json:"name"`
+	Avatar   string `json:"avatar"`
+}
+
+====================================================================================================
+
+internal/modules/user/errors.go
+package user
+
+import "errors"
+
+var (
+	ErrUserNotFound = errors.New("user not found")
+)
+
+====================================================================================================
+
+internal/modules/user/handler.go
+package user
+
+import (
+	"errors"
+	"gomess/internal/config"
+	"gomess/internal/context"
+	"gomess/internal/logger"
+	"gomess/internal/modules/user/dto"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+type HandlerInterface interface {
+	GetMe(c *gin.Context)
+	Search(c *gin.Context)
+	DeleteMe(c *gin.Context)
+}
+
+type Handler struct {
+	service ServiceInterface
+	cfg     config.ConfigInterface
+}
+
+func NewHandler(service ServiceInterface, cfg config.ConfigInterface) *Handler {
+	return &Handler{service: service, cfg: cfg}
+}
+
+// GetMe godoc
+//
+//	@Summary		Get current user
+//	@Description	Get information of authenticated user
+//	@Tags			User
+//
+//	@Produce		json
+//
+//	@Security		BearerAuth
+//
+//	@Success		200	{object}	dto.GetMeResponse
+//
+//	@Router			/user/me [get]
+func (h *Handler) GetMe(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	user, err := h.service.GetMe(userID)
+
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+
+		logger.FromGin(c).Error("get me error", "error", err)
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, user)
+}
+
+// Search godoc
+//
+//	@Summary		Search users
+//	@Description	Search users by provider and keyword
+//	@Tags			User
+//
+//	@Produce		json
+//
+//	@Security		BearerAuth
+//
+//	@Param			provider	query	string	true	"Provider"
+//	@Param			keyword		query	string	true	"Search keyword"
+//	@Param			skip		query	int		false	"Skip"
+//	@Param			limit		query	int		false	"Limit"
+//
+//	@Success		200			{array}	dto.SearchResponse
+//
+//	@Router			/user/search [get]
+func (h *Handler) Search(c *gin.Context) {
+
+	var req dto.SearchRequest
+
+	if err := c.ShouldBindQuery(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query parameters"})
+		return
+	}
+
+	users, err := h.service.Search(&req)
+
+	if err != nil {
+		logger.FromGin(c).Error("search users error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, users)
+}
+
+// DeleteMe godoc
+//
+//	@Summary		Delete my account
+//	@Description	Permanently delete the authenticated user's account and all related data (friends, messages, attachment metadata)
+//	@Tags			User
+//	@Accept			json
+//	@Produce		json
+//	@Security		BearerAuth
+//	@Param			request	body	dto.DeleteMeRequest	true	"Confirmation"
+//	@Success		200
+//	@Router			/user/me [delete]
+func (h *Handler) DeleteMe(c *gin.Context) {
+	userID := c.GetInt64(context.UserIDKey)
+
+	var req dto.DeleteMeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "must confirm account deletion"})
+		return
+	}
+
+	if err := h.service.DeleteMe(userID); err != nil {
+		logger.FromGin(c).Error("delete me error", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "account deleted"})
+
+	// Should call /auth/logout in client side to clear refresh token
+}
+
+====================================================================================================
+
+internal/modules/user/module.go
+package user
+
+import (
+	"gomess/internal/middleware"
+	"gomess/internal/modules"
+	"gomess/internal/redis"
+	"gomess/pkg/jwt"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Module struct {
+	handler HandlerInterface
+	jwt     jwt.JWTInterface
+	redis   redis.RedisInterface
+}
+
+func NewModule(ctx *modules.ModuleContext, repo RepositoryInterface) *Module {
+	handler := NewHandler(NewService(repo), ctx.Cfg)
+
+	return &Module{handler: handler, jwt: ctx.JWT, redis: ctx.Redis}
+}
+
+func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
+	user := rg.Group("/user")
+
+	protected := user.Group("/")
+	protected.Use(middleware.Auth(m.jwt))
+
+	protected.GET("/me", m.handler.GetMe)
+	protected.GET(
+		"/search", 
+		middleware.RateLimit(m.redis, "search", 30, time.Minute, middleware.RateLimitByUser),
+		m.handler.Search,
+	)
+	protected.DELETE("/me", m.handler.DeleteMe)
+}
+
+====================================================================================================
+
+internal/modules/user/repository.go
+package user
+
+import (
+	"database/sql"
+	"gomess/internal/database"
+	"gomess/internal/models"
+)
+
+type RepositoryInterface interface {
+	GetByID(id int64) (*models.User, error)
+	Search(provider string, keyword string, skip int, limit int) ([]*models.User, error)
+	ExistsUser(userID int64) (bool, error)
+	DeleteUser(userID int64) error
+}
+
+type Repository struct {
+	db database.DatabaseInterface
+}
+
+func NewRepository(db database.DatabaseInterface) *Repository {
+	return &Repository{db: db}
+}
+
+func (r *Repository) GetByID(id int64) (*models.User, error) {
+	var user models.User
+
+	query := `
+	SELECT id, provider, provider_id, account, name, avatar
+	FROM users
+	WHERE id = ?
+	LIMIT 1
+	`
+
+	err := r.db.GetDB().QueryRow(query, id).Scan(
+		&user.ID,
+		&user.Provider,
+		&user.ProviderID,
+		&user.Account,
+		&user.Name,
+		&user.Avatar,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+func (r *Repository) Search(provider string, keyword string, skip int, limit int) ([]*models.User, error) {
+	query := `
+	SELECT id, provider, provider_id, account, name, avatar
+	FROM users
+	WHERE provider = ? AND LOWER(account) LIKE LOWER(?)
+	ORDER BY name
+	LIMIT ? OFFSET ?
+	`
+
+	rows, err := r.db.GetDB().Query(query, provider, keyword, limit, skip)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	users := []*models.User{}
+
+	for rows.Next() {
+		var user models.User
+
+		err := rows.Scan(
+			&user.ID,
+			&user.Provider,
+			&user.ProviderID,
+			&user.Account,
+			&user.Name,
+			&user.Avatar,
+		)
+
+		if err != nil {
+			return nil, err
+		}
+
+		users = append(users, &user)
+	}
+
+	return users, nil
+}
+
+func (r *Repository) ExistsUser(userID int64) (bool, error) {
+	query := `
+	SELECT EXISTS(
+		SELECT 1
+		FROM users
+		WHERE id = ?
+	)
+	`
+	var exists bool
+	err := r.db.GetDB().QueryRow(query, userID).Scan(&exists)
+
+	return exists, err
+}
+
+func (r *Repository) DeleteUser(userID int64) error {
+	query := `
+	DELETE FROM users
+	WHERE id = ?
+	`
+
+	_, err := r.db.GetDB().Exec(query, userID)
+	return err
+}
+
+====================================================================================================
+
+internal/modules/user/service.go
+package user
+
+import (
+	"gomess/internal/modules/user/dto"
+	"gomess/utils"
+)
+
+type ServiceInterface interface {
+	GetMe(userID int64) (*dto.GetMeResponse, error)
+	Search(req *dto.SearchRequest) ([]dto.SearchResponse, error)
+	DeleteMe(userID int64) error
+}
+
+type Service struct {
+	repo RepositoryInterface
+}
+
+func NewService(repo RepositoryInterface) *Service {
+	return &Service{repo: repo}
+}
+
+func (s *Service) GetMe(userID int64) (*dto.GetMeResponse, error) {
+	user, err := s.repo.GetByID(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	if user == nil {
+		return nil, ErrUserNotFound
+	}
+
+	return &dto.GetMeResponse{
+		ID:      user.ID,
+		Account: user.Account,
+		Name:    user.Name,
+		Avatar:  user.Avatar,
+	}, nil
+}
+
+func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
+	if req.Skip < 0 {
+		req.Skip = 0
+	}
+
+	if req.Limit <= 0 {
+		req.Limit = 20
+	}
+
+	if req.Limit > 100 {
+		req.Limit = 100
+	}
+
+	users, err := s.repo.Search(
+		req.Provider,
+		utils.BuildLikePattern(req.Keyword),
+		req.Skip,
+		req.Limit,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	resp := make([]dto.SearchResponse, 0, len(users))
+
+	for _, user := range users {
+		resp = append(resp, dto.SearchResponse{
+			ID:       user.ID,
+			Provider: user.Provider,
+			Account:  user.Account,
+			Name:     user.Name,
+			Avatar:   user.Avatar,
+		})
+	}
+
+	return resp, nil
+}
+
+func (s *Service) DeleteMe(userID int64) error {
+	return s.repo.DeleteUser(userID)
+}
+
+====================================================================================================
+
+internal/redis/errors.go
+package redis
+
+import "errors"
+
+var (
+	ErrNotFound = errors.New("key not found")
+)
+
+====================================================================================================
+
+internal/redis/redis.go
+package redis
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	goredis "github.com/redis/go-redis/v9"
+)
+
+type RedisInterface interface {
+	Set(ctx context.Context, key string, value any, expiration time.Duration) error
+	Get(ctx context.Context, key string) (string, error)
+	GetDel(ctx context.Context, key string) (string, error)
+	Delete(ctx context.Context, key string) error
+	Incr(ctx context.Context, key string) (int64, error)
+	Expire(ctx context.Context, key string, expiration time.Duration) error
+}
+
+type Redis struct {
+	client *goredis.Client
+}
+
+func NewRedis(addr string) *Redis {
+	client := goredis.NewClient(&goredis.Options{
+		Addr: addr,
+	})
+
+	return &Redis{client: client}
+}
+
+func (r *Redis) Set(
+	ctx context.Context,
+	key string,
+	value any,
+	expiration time.Duration,
+) error {
+	return r.client.Set(ctx, key, value, expiration).Err()
+}
+
+func (r *Redis) Get(ctx context.Context, key string) (string, error) {
+	return r.client.Get(ctx, key).Result()
+}
+
+func (r *Redis) GetDel(ctx context.Context, key string) (string, error) {
+	val, err := r.client.GetDel(ctx, key).Result()
+	if errors.Is(err, goredis.Nil) {
+		return "", ErrNotFound
+	}
+	return val, err
+}
+
+func (r *Redis) Delete(ctx context.Context, key string) error {
+	return r.client.Del(ctx, key).Err()
+}
+
+func (r *Redis) Incr(ctx context.Context, key string) (int64, error) {
+	return r.client.Incr(ctx, key).Result()
+}
+
+func (r *Redis) Expire(ctx context.Context, key string, expiration time.Duration) error {
+	return r.client.Expire(ctx, key, expiration).Err()
+}
+
+====================================================================================================
+
+internal/ws/client.go
+package ws
+
+import (
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+type Client struct {
+	hub    *Hub
+	conn   *websocket.Conn
+	userID int64
+	send   chan []byte
+}
+
+func newClient(hub *Hub, conn *websocket.Conn, userID int64) *Client {
+	return &Client{
+		hub: hub,
+		conn: conn,
+		userID: userID,
+		send: make(chan []byte, 32),
+	}
+}
+
+func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister(c)
+		c.conn.Close()
+	}()
+
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	for {
+		if _, _, err := c.conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
+func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+
+	for {
+		select {
+		case msg, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+====================================================================================================
+
+internal/ws/const.go
+package ws
+
+import "time"
+
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 4096
+)
+
+====================================================================================================
+
+internal/ws/handler.go
+package ws
+
+import (
+	"gomess/internal/logger"
+	"gomess/pkg/jwt"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *http.Request) bool { return true },
+}
+
+type Handler struct {
+	hub *Hub
+	jwt jwt.JWTInterface
+}
+
+func NewHandler(hub *Hub, jwt jwt.JWTInterface) *Handler {
+	return &Handler{
+		hub: hub,
+		jwt: jwt,
+	}
+}
+
+func (h *Handler) Serve(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "token is required"})
+		return
+	}
+
+	userID, err := h.jwt.ParseAccessToken(token)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+		return
+	}
+
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		logger.FromGin(c).Error("websocket upgrade failed", "error", err)
+		return
+	}
+
+	client := newClient(h.hub, conn, userID)
+	h.hub.register(client)
+
+	go client.writePump()
+	go client.readPump()
+}
+
+====================================================================================================
+
+internal/ws/hub.go
+package ws
+
+import (
+	"encoding/json"
+	"sync"
+)
+
+type Hub struct {
+	mu      sync.RWMutex
+	clients map[int64]map[*Client]struct{}
+}
+
+func NewHub() *Hub {
+	return &Hub{
+		clients: make(map[int64]map[*Client]struct{}),
+	}
+}
+
+func (h *Hub) register(c *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.clients[c.userID] == nil {
+		h.clients[c.userID] = make(map[*Client]struct{})
+	}
+	h.clients[c.userID][c] = struct{}{}
+}
+
+func (h *Hub) unregister(c *Client) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	delete(h.clients[c.userID], c)
+	if len(h.clients[c.userID]) == 0 {
+		delete(h.clients, c.userID)
+	}
+}
+
+type envelope struct {
+	Event string `json:"event"`
+	Data  any    `json:"data"`
+}
+
+func (h *Hub) SendToUser(userID int64, event string, data any) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	clients, ok := h.clients[userID]
+	if !ok {
+		return
+	}
+
+	payload, err := json.Marshal(envelope{Event: event, Data: data})
+	if err != nil {
+		return
+	}
+
+	for c := range clients {
+		select {
+		case c.send <- payload:
+		default:
+		}
+	}
+}
+
+====================================================================================================
+
+internal/ws/module.go
+package ws
+
+import (
+	"gomess/internal/modules"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Module struct {
+	handler *Handler
+}
+
+func NewModule(ctx *modules.ModuleContext, hub *Hub) *Module {
+	return &Module{handler: NewHandler(hub, ctx.JWT)}
+}
+
+func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
+	rg.GET("/ws", m.handler.Serve)
+}
+
+====================================================================================================
+
+migrations/000001_create_users.down.sql
+DROP TABLE users;
+
+====================================================================================================
+
+migrations/000001_create_users.up.sql
+CREATE TABLE users (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    provider VARCHAR(50) NOT NULL,
+    provider_id VARCHAR(255) NOT NULL,
+
+    account VARCHAR(255) NOT NULL,
+    name VARCHAR(255),
+    avatar TEXT,
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uk_provider_provider_id (
+        provider,
+        provider_id,
+        account
+    )
+);
+
+====================================================================================================
+
+migrations/000002_create_friend_requests.down.sql
+DROP TABLE friend_requests;
+
+====================================================================================================
+
+migrations/000002_create_friend_requests.up.sql
+CREATE TABLE friend_requests (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+
+    sender_id BIGINT UNSIGNED NOT NULL,
+    receiver_id BIGINT UNSIGNED NOT NULL,
+
+    status ENUM(
+        'pending',
+        'accepted',
+        'rejected'
+    ) NOT NULL DEFAULT 'pending',
+
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
+
+    updated_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_friend_request_sender
+        FOREIGN KEY (sender_id)
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_friend_request_receiver
+        FOREIGN KEY (receiver_id)
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_sender_receiver
+        CHECK(sender_id <> receiver_id),
+
+    UNIQUE KEY uk_friend_request(
+        sender_id,
+        receiver_id
+    )
+);
+
+====================================================================================================
+
+migrations/000003_create_friends.down.sql
+DROP TABLE friends;
+
+====================================================================================================
+
+migrations/000003_create_friends.up.sql
+CREATE TABLE friends (
+    user1_id BIGINT UNSIGNED NOT NULL,
+    user2_id BIGINT UNSIGNED NOT NULL,
+
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY(
+        user1_id,
+        user2_id
+    ),
+
+    CONSTRAINT fk_friend_user1
+        FOREIGN KEY(user1_id)
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_friend_user2
+        FOREIGN KEY(user2_id)
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_friend_users
+        CHECK(user1_id < user2_id)
+);
+
+====================================================================================================
+
+migrations/000004_create_messages.down.sql
+DROP TABLE messages;
+
+====================================================================================================
+
+migrations/000004_create_messages.up.sql
+CREATE TABLE messages (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    sender_id BIGINT UNSIGNED NOT NULL,
+    receiver_id BIGINT UNSIGNED NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TIMESTAMP NULL DEFAULT NULL,
+
+    CONSTRAINT fk_message_sender FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_message_receiver FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT chk_message_sender_receiver CHECK (sender_id <> receiver_id),
+
+    INDEX idx_message_conversation_1 (sender_id, receiver_id, id),
+    INDEX idx_message_conversation_2 (receiver_id, sender_id, id)
+);
+
+====================================================================================================
+
+migrations/000005_create_message_attachments.down.sql
+DROP TABLE message_attachments;
+
+====================================================================================================
+
+migrations/000005_create_message_attachments.up.sql
+CREATE TABLE message_attachments (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+
+    message_id BIGINT UNSIGNED NOT NULL,
+    type ENUM('image', 'video', 'audio', 'file') NOT NULL,
+    object_key VARCHAR(1024) NOT NULL,
+    file_name VARCHAR(255) NOT NULL,
+    mime_type VARCHAR(128) NOT NULL,
+    size_bytes BIGINT UNSIGNED NOT NULL,
+
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_attachment_message
+        FOREIGN KEY (message_id) REFERENCES messages(id)
+        ON DELETE CASCADE,
+
+    INDEX idx_attachment_message (message_id)
+);
+
+====================================================================================================
+
+migrations/000006_create_message_deletions.down.sql
+DROP TABLE message_deletions;
+
+====================================================================================================
+
+migrations/000006_create_message_deletions.up.sql
+CREATE TABLE message_deletions (
+    message_id BIGINT UNSIGNED NOT NULL,
+    user_id BIGINT UNSIGNED NOT NULL,
+    deleted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (message_id, user_id),
+
+    CONSTRAINT fk_message_deletion_message
+        FOREIGN KEY (message_id) REFERENCES messages(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_message_deletion_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
+        ON DELETE CASCADE
+);
+
+====================================================================================================
+
+pkg/authprovider/google.go
+package authprovider
+
+import (
+	"context"
+	"errors"
+
+	"google.golang.org/api/idtoken"
+)
+
+type GoogleProvider struct {
+	clientID string
+}
+
+func NewGoogleProvider(clientID string) *GoogleProvider {
+	return &GoogleProvider{clientID: clientID}
+}
+
+func (g *GoogleProvider) Verify(token string) (*UserInfo, error) {
+	payload, err := idtoken.Validate(context.Background(), token, g.clientID)
+	if err != nil {
+		return nil, err
+	}
+
+	email, _ := payload.Claims["email"].(string)
+	name, _ := payload.Claims["name"].(string)
+	picture, _ := payload.Claims["picture"].(string)
+
+	if email == "" {
+		return nil, errors.New("Invalid token")
+	}
+
+	return &UserInfo{
+		ID:      payload.Subject,
+		Account: email,
+		Name:    name,
+		Avatar:  picture,
+	}, nil
+}
+
+====================================================================================================
+
+pkg/authprovider/provider.go
+package authprovider
+
+type UserInfo struct {
+	ID      string
+	Account string
+	Name    string
+	Avatar  string
+}
+
+type ProviderInterface interface {
+	Verify(token string) (*UserInfo, error)
+}
+
+====================================================================================================
+
+pkg/jwt/errors.go
+package jwt
+
+import "errors"
+
+var (
+	ErrExpiredToken = errors.New("token expired")
+	ErrInvalidToken = errors.New("invalid token")
+)
+
+====================================================================================================
+
+pkg/jwt/jwt.go
+package jwt
+
+import (
+	"errors"
+	"gomess/utils"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+type JWTInterface interface {
+	GenerateAccessToken(userID int64) (string, error)
+	ParseAccessToken(tokenString string) (int64, error)
+	GenerateRefreshToken() (string, error)
+}
+
+type JWT struct {
+	secret string
+}
+
+func NewJWT(secret string) *JWT {
+	return &JWT{secret: secret}
+}
+
+func (j *JWT) GenerateAccessToken(userID int64) (string, error) {
+	token := jwt.NewWithClaims(
+		jwt.SigningMethodHS256,
+		jwt.MapClaims{
+			"user_id": userID,
+			"exp":     time.Now().Add(5 * time.Minute).Unix(),
+		})
+	return token.SignedString([]byte(j.secret))
+}
+
+func (j *JWT) ParseAccessToken(tokenString string) (int64, error) {
+	token, err := jwt.Parse(
+		tokenString,
+		func(token *jwt.Token) (any, error) {
+			return []byte(j.secret), nil
+		},
+	)
+
+	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return 0, ErrExpiredToken
+		}
+		return 0, ErrInvalidToken
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		return 0, ErrInvalidToken
+	}
+
+	rawUserID, ok := claims["user_id"].(float64)
+	if !ok {
+		return 0, ErrInvalidToken
+	}
+
+	return int64(rawUserID), nil
+}
+
+func (j *JWT) GenerateRefreshToken() (string, error) {
+	return utils.GenerateToken(32)
+}
+
+====================================================================================================
+
+pkg/storage/minio.go
+package storage
+
+import (
+	"context"
+	"net/url"
+	"time"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+)
+
+type ObjectInfo struct {
+	Exists      bool
+	SizeBytes   int64
+	ContentType string
+}
+
+type ObjectSummary struct {
+	Key          string
+	LastModified time.Time
+}
+
+type StorageInterface interface {
+	PresignedPutURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	PresignedGetURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error)
+	StatObject(ctx context.Context, objectKey string) (ObjectInfo, error)
+	ListObjects(ctx context.Context, prefix string) ([]ObjectSummary, error)
+	DeleteObject(ctx context.Context, objectKey string) error
+}
+
+type Storage struct {
+	client *minio.Client
+	bucket string
+}
+
+func NewStorage(endpoint, accessKey, secretKey, bucket string, useSSL bool) (*Storage, error) {
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds: credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: useSSL,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+
+	exists, err := client.BucketExists(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		if err := client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+			return nil, err
+		}
+	}
+
+	return &Storage{
+		client: client,
+		bucket: bucket,
+	}, nil
+}
+
+func (s *Storage) PresignedPutURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	u, err := s.client.PresignedPutObject(ctx, s.bucket, objectKey, expiry)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+func (s *Storage) PresignedGetURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
+	u, err := s.client.PresignedGetObject(ctx, s.bucket, objectKey, expiry, url.Values{})
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+func (s *Storage) StatObject(ctx context.Context, objectKey string) (ObjectInfo, error) {
+	info, err := s.client.StatObject(ctx, s.bucket, objectKey, minio.StatObjectOptions{})
+	if err != nil {
+		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+			return ObjectInfo{Exists: false}, nil
+		}
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{
+		Exists:      true,
+		SizeBytes:   info.Size,
+		ContentType: info.ContentType,
+	}, nil
+}
+
+func (s *Storage) ListObjects(ctx context.Context, prefix string) ([]ObjectSummary, error) {
+	var result []ObjectSummary
+
+	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
+		Prefix: prefix,
+		Recursive: true,
+	}) {
+		if obj.Err != nil {
+			return nil, obj.Err
+		}
+		result = append(result, ObjectSummary{Key: obj.Key, LastModified: obj.LastModified})
+	}
+
+	return result, nil
+}
+
+func (s *Storage) DeleteObject(ctx context.Context, objectKey string) error {
+	return s.client.RemoveObject(ctx, s.bucket, objectKey, minio.RemoveObjectOptions{})
+}
+
+====================================================================================================
+
+utils/generate_token.go
+package utils
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+)
+
+func GenerateToken(length int) (string, error) {
+
+	bytes := make([]byte, length)
+
+	_, err := rand.Read(bytes)
+	if err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(bytes), nil
+}
+
+====================================================================================================
+
+utils/hash.go
+package utils
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+)
+
+func SHA256(value string) string {
+	hash := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(hash[:])
+}
+
+====================================================================================================
+
+utils/search.go
+package utils
+
+import "strings"
+
+func BuildLikePattern(keywork string) string {
+	keywork = strings.ToLower(strings.TrimSpace(keywork))
+	var builder strings.Builder
+	builder.WriteByte('%')
+
+	for _, r := range keywork {
+		builder.WriteRune(r)
+		builder.WriteByte('%')
+	}
+	return builder.String()
+}
+
+====================================================================================================
+

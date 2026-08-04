@@ -2,7 +2,6 @@ package authprovider
 
 import (
 	"context"
-	"errors"
 
 	"google.golang.org/api/idtoken"
 )
@@ -26,13 +25,13 @@ func (g *GoogleProvider) Verify(token string) (*UserInfo, error) {
 	picture, _ := payload.Claims["picture"].(string)
 
 	if email == "" {
-		return nil, errors.New("Invalid token")
+		return nil, ErrInvalidToken
 	}
 
 	return &UserInfo{
-		ID:     payload.Subject,
-		Email:  email,
-		Name:   name,
-		Avatar: picture,
+		ID:      payload.Subject,
+		Account: email,
+		Name:    name,
+		Avatar:  picture,
 	}, nil
 }

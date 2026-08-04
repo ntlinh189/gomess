@@ -2,6 +2,7 @@ package jwt
 
 import (
 	"errors"
+	"gomess/utils"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -10,6 +11,7 @@ import (
 type JWTInterface interface {
 	GenerateAccessToken(userID int64) (string, error)
 	ParseAccessToken(tokenString string) (int64, error)
+	GenerateRefreshToken() (string, error)
 }
 
 type JWT struct {
@@ -39,16 +41,25 @@ func (j *JWT) ParseAccessToken(tokenString string) (int64, error) {
 	)
 
 	if err != nil {
-		return 0, err
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return 0, ErrExpiredToken
+		}
+		return 0, ErrInvalidToken
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
-
 	if !ok || !token.Valid {
-		return 0, errors.New("invalid token")
+		return 0, ErrInvalidToken
 	}
 
-	userID := int64(claims["user_id"].(float64))
+	rawUserID, ok := claims["user_id"].(float64)
+	if !ok {
+		return 0, ErrInvalidToken
+	}
 
-	return userID, nil
+	return int64(rawUserID), nil
+}
+
+func (j *JWT) GenerateRefreshToken() (string, error) {
+	return utils.GenerateToken(32)
 }

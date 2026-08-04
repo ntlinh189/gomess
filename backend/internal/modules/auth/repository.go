@@ -21,7 +21,7 @@ func NewRepository(db database.DatabaseInterface) *Repository {
 
 func (r *Repository) FindByProvider(provider, providerID string) (*models.User, error) {
 	query := `
-	SELECT id, provider, provider_id, email, name, avatar
+	SELECT id, provider, provider_id, account, name, avatar
 	FROM users
 	WHERE provider = ? AND provider_id = ?
 	LIMIT 1
@@ -35,7 +35,7 @@ func (r *Repository) FindByProvider(provider, providerID string) (*models.User, 
 		&user.ID,
 		&user.Provider,
 		&user.ProviderID,
-		&user.Email,
+		&user.Account,
 		&user.Name,
 		&user.Avatar,
 	)
@@ -53,7 +53,7 @@ func (r *Repository) FindByProvider(provider, providerID string) (*models.User, 
 
 func (r *Repository) Create(user *models.User) error {
 	query := `
-	INSERT INTO users(provider, provider_id, email, name, avatar)
+	INSERT INTO users(provider, provider_id, account, name, avatar)
 	VALUES (?, ?, ?, ?, ?)
 	`
 
@@ -61,7 +61,7 @@ func (r *Repository) Create(user *models.User) error {
 		query,
 		user.Provider,
 		user.ProviderID,
-		user.Email,
+		user.Account,
 		user.Name,
 		user.Avatar,
 	)

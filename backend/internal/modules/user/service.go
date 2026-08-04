@@ -8,6 +8,7 @@ import (
 type ServiceInterface interface {
 	GetMe(userID int64) (*dto.GetMeResponse, error)
 	Search(req *dto.SearchRequest) ([]dto.SearchResponse, error)
+	DeleteMe(userID int64) error
 }
 
 type Service struct {
@@ -24,11 +25,15 @@ func (s *Service) GetMe(userID int64) (*dto.GetMeResponse, error) {
 		return nil, err
 	}
 
+	if user == nil {
+		return nil, ErrUserNotFound
+	}
+
 	return &dto.GetMeResponse{
-		ID:     user.ID,
-		Email:  user.Email,
-		Name:   user.Name,
-		Avatar: user.Avatar,
+		ID:      user.ID,
+		Account: user.Account,
+		Name:    user.Name,
+		Avatar:  user.Avatar,
 	}, nil
 }
 
@@ -59,15 +64,18 @@ func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
 	resp := make([]dto.SearchResponse, 0, len(users))
 
 	for _, user := range users {
-
 		resp = append(resp, dto.SearchResponse{
 			ID:       user.ID,
 			Provider: user.Provider,
-			Email:    user.Email,
+			Account:  user.Account,
 			Name:     user.Name,
 			Avatar:   user.Avatar,
 		})
 	}
 
 	return resp, nil
+}
+
+func (s *Service) DeleteMe(userID int64) error {
+	return s.repo.DeleteUser(userID)
 }

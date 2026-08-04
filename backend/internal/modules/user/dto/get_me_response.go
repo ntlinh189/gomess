@@ -1,8 +1,8 @@
 package dto
 
 type GetMeResponse struct {
-	ID     int64  `json:"id"`
-	Email  string `json:"email"`
-	Name   string `json:"name"`
-	Avatar string `json:"avatar"`
+	ID      int64  `json:"id"`
+	Account string `json:"account"`
+	Name    string `json:"name"`
+	Avatar  string `json:"avatar"`
 }

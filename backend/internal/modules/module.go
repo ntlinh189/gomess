@@ -18,4 +18,5 @@ type ModuleContext struct {
 	JWT   jwt.JWTInterface
 	Cfg   config.ConfigInterface
 	Redis redis.RedisInterface
+	
 }

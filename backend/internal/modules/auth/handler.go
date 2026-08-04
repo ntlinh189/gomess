@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"gomess/internal/config"
 	"gomess/internal/modules/auth/dto"
 	"net/http"
@@ -45,33 +46,18 @@ func (h *Handler) Login(c *gin.Context) {
 	var req dto.LoginRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
 	result, refreshToken, err := h.service.Login(provider, req.Token)
 
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "login failed"})
 		return
 	}
 
-	c.SetSameSite(func() http.SameSite {
-		if h.cfg.IsProduction() {
-			return http.SameSiteNoneMode
-		}
-		return http.SameSiteLaxMode
-	}())
-
-	c.SetCookie(
-		"refresh_token",
-		refreshToken,
-		int((30 * 24 * time.Hour).Seconds()),
-		"/",
-		"",
-		h.cfg.IsProduction(),
-		true,
-	)
+	h.setRefreshCookie(c, refreshToken)
 
 	c.JSON(http.StatusOK, result)
 }
@@ -91,16 +77,25 @@ func (h *Handler) Refresh(c *gin.Context) {
 	refreshToken, err := c.Cookie("refresh_token")
 
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired cookie refresh token"})
 		return
 	}
 
-	result, err := h.service.Refresh(refreshToken)
+	result, newRefreshToken, err := h.service.Refresh(refreshToken)
 
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		h.clearRefreshCookie(c)
+
+		if errors.Is(err, ErrInvalidRefreshToken) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired refresh token"})
+			return
+		}
+
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
+
+	h.setRefreshCookie(c, newRefreshToken)
 
 	c.JSON(http.StatusOK, result)
 }
@@ -123,13 +118,33 @@ func (h *Handler) Logout(c *gin.Context) {
 		h.service.Logout(refreshToken)
 	}
 
-	c.SetSameSite(func() http.SameSite {
-		if h.cfg.IsProduction() {
-			return http.SameSiteNoneMode
-		}
-		return http.SameSiteLaxMode
-	}())
+	h.clearRefreshCookie(c)
 
+	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
+}
+
+func (h *Handler) sameSiteMode() http.SameSite {
+	if h.cfg.IsProduction() {
+		return http.SameSiteNoneMode
+	}
+	return http.SameSiteLaxMode
+}
+
+func (h *Handler) setRefreshCookie(c *gin.Context, refreshToken string) {
+	c.SetSameSite(h.sameSiteMode())
+	c.SetCookie(
+		"refresh_token",
+		refreshToken,
+		int((30 * 24 * time.Hour).Seconds()),
+		"/",
+		"",
+		h.cfg.IsProduction(),
+		true,
+	)
+}
+
+func (h *Handler) clearRefreshCookie(c *gin.Context) {
+	c.SetSameSite(h.sameSiteMode())
 	c.SetCookie(
 		"refresh_token",
 		"",
@@ -139,6 +154,4 @@ func (h *Handler) Logout(c *gin.Context) {
 		h.cfg.IsProduction(),
 		true,
 	)
-
-	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }

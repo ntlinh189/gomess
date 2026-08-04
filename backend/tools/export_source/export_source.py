@@ -1,7 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_FILE = ROOT / "tools" / "export_source" / ".out"
+OUTPUT_FILE = ROOT / "tools" / "export_source" / "out.txt"
 
 IGNORE_DIRS = {
     ".git",

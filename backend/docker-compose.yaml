@@ -1,22 +1,81 @@
-version: '3.8'
-
 services:
   mysql:
     image: mysql:8.0
     container_name: gomess-mysql
-
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: gomess
       MYSQL_USER: gomess
       MYSQL_PASSWORD: 123456
-
     ports:
       - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7
     container_name: gomess-redis
-
     ports:
       - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: gomess-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: gomess
+      MINIO_ROOT_PASSWORD: gomess12345
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console web
+    volumes:
+      - minio-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: gomess-api
+    env_file:
+      - .env
+    environment:
+      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      REDIS_ADDR: "redis:6379"
+      MINIO_ENDPOINT: "minio:9000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    container_name: gomess-worker
+    env_file:
+      - .env
+    environment:
+      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      MINIO_ENDPOINT: "minio:9000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  minio-data:
