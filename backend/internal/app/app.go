@@ -46,10 +46,7 @@ func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	r.Use(cors.New(cors.Config{
-		/// TODO: Change to client url
-		AllowOrigins: []string{
-			"http://localhost:3000",
-		},
+		AllowOrigins: cfg.GetClientOrigins(),
 		AllowMethods: []string{
 			"GET",
 			"POST",
@@ -85,10 +82,10 @@ func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 
 	storageClient, err := storage.NewStorage(
 		cfg.GetMinioEndpoint(),
+		cfg.GetMinioPublicEndpoint(),
 		cfg.GetMinioAccessKey(),
 		cfg.GetMinioSecretKey(),
 		cfg.GetMinioBucket(),
-		cfg.MinioUseSSL(),
 	)
 	if err != nil {
 		return nil, err

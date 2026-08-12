@@ -1,37 +1,38 @@
 package ws
 
 import (
+	"gomess/internal/config"
 	"gomess/internal/context"
 	"gomess/internal/logger"
 	"gomess/pkg/jwt"
 	"net/http"
+	"slices"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool {
-		origin := r.Header.Get(context.OriginKey)
-		if origin == "" {
-			return true
-		}
-		/// TODO: Change to client url
-		return origin == "http://localhost:3000"
-	},
-}
-
 type Handler struct {
-	hub *Hub
-	jwt jwt.JWTInterface
+	hub      *Hub
+	jwt      jwt.JWTInterface
+	upgrader websocket.Upgrader
 }
 
-func NewHandler(hub *Hub, jwt jwt.JWTInterface) *Handler {
+func NewHandler(hub *Hub, jwt jwt.JWTInterface, cfg config.ConfigInterface) *Handler {
 	return &Handler{
 		hub: hub,
 		jwt: jwt,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get(context.OriginKey)
+				if origin == "" {
+					return true
+				}
+				return slices.Contains(cfg.GetClientOrigins(), origin)
+			},
+		},
 	}
 }
 
@@ -48,7 +49,7 @@ func (h *Handler) Serve(c *gin.Context) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		logger.FromGin(c).Error("websocket upgrade failed", "error", err)
 		return

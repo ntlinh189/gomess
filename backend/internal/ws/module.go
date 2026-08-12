@@ -11,9 +11,11 @@ type Module struct {
 }
 
 func NewModule(ctx *modules.ModuleContext, hub *Hub) *Module {
-	return &Module{handler: NewHandler(hub, ctx.JWT)}
+	return &Module{handler: NewHandler(hub, ctx.JWT, ctx.Cfg)}
 }
 
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
-	rg.GET("/ws", m.handler.Serve)
+	ws := rg.Group("/ws")
+	
+	ws.GET("", m.handler.Serve)
 }

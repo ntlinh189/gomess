@@ -7,7 +7,7 @@ import (
 
 type ServiceInterface interface {
 	GetMe(userID int64) (*dto.GetMeResponse, error)
-	Search(req *dto.SearchRequest) ([]dto.SearchResponse, error)
+	Search(userID int64, req *dto.SearchRequest) ([]dto.SearchResponse, error)
 	DeleteMe(userID int64) error
 }
 
@@ -37,7 +37,7 @@ func (s *Service) GetMe(userID int64) (*dto.GetMeResponse, error) {
 	}, nil
 }
 
-func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
+func (s *Service) Search(userID int64, req *dto.SearchRequest) ([]dto.SearchResponse, error) {
 	if req.Skip < 0 {
 		req.Skip = 0
 	}
@@ -51,6 +51,7 @@ func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
 	}
 
 	users, err := s.repo.Search(
+		userID,
 		req.Provider,
 		utils.BuildLikePattern(req.Keyword),
 		req.Skip,
@@ -65,11 +66,12 @@ func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
 
 	for _, user := range users {
 		resp = append(resp, dto.SearchResponse{
-			ID:       user.ID,
-			Provider: user.Provider,
-			Account:  user.Account,
-			Name:     user.Name,
-			Avatar:   user.Avatar,
+			ID:            user.ID,
+			Provider:      user.Provider,
+			Account:       user.Account,
+			Name:          user.Name,
+			Avatar:        user.Avatar,
+			RequestStatus: user.RequestStatus,
 		})
 	}
 

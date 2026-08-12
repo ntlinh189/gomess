@@ -1,53 +1,25 @@
-import { api, unwrapResponse } from "./client";
+import { api } from "./client";
+import type { Friend, FriendRequest, OAuthProvider, UserSearchResult } from "@/types/user";
 
-export interface UserSearchResult {
-  id: number;
-  provider: string;
-  account: string;
-  name: string;
-  avatar?: string;
+export async function listFriends() {
+  const { data } = await api.get<Friend[]>("/friends");
+  return data;
 }
 
-export interface FriendRequestItem {
-  id: number;
-  senderID: number;
-  receiverID: number;
-  status: string;
-  createdAt?: string;
+export async function searchUsers(provider: OAuthProvider, keyword: string, skip = 0, limit = 20) {
+  const { data } = await api.get<UserSearchResult[]>("/user/search", { params: { provider, keyword, skip, limit } });
+  return data;
 }
 
-export async function listConversations() {
-  const response = await api.get("/friends");
-  return unwrapResponse(response);
+export async function sendFriendRequest(receiverId: number) {
+  await api.post("/friends/requests", { receiver_id: receiverId });
 }
 
 export async function listReceivedRequests() {
-  const response = await api.get("/friends/requests/received");
-  return unwrapResponse(response) as FriendRequestItem[];
+  const { data } = await api.get<FriendRequest[]>("/friends/requests/received");
+  return data;
 }
 
-export async function searchUsers(keyword: string) {
-  const response = await api.get("/user/search", {
-    params: {
-      provider: "google",
-      keyword,
-      limit: 10,
-    },
-  });
-  return unwrapResponse(response) as UserSearchResult[];
-}
-
-export async function createConversation(userId: string) {
-  const response = await api.post("/friends/requests", { receiver_id: Number(userId) });
-  return unwrapResponse(response);
-}
-
-export async function acceptFriendRequest(requestId: string | number) {
-  const response = await api.post(`/friends/requests/${requestId}/accept`);
-  return unwrapResponse(response);
-}
-
-export async function rejectFriendRequest(requestId: string | number) {
-  const response = await api.post(`/friends/requests/${requestId}/reject`);
-  return unwrapResponse(response);
-}
+export async function acceptFriendRequest(requestId: number) { await api.post(`/friends/requests/${requestId}/accept`); }
+export async function rejectFriendRequest(requestId: number) { await api.post(`/friends/requests/${requestId}/reject`); }
+export async function removeFriend(friendId: number) { await api.delete(`/friends/${friendId}`); }

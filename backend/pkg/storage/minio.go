@@ -29,14 +29,26 @@ type StorageInterface interface {
 }
 
 type Storage struct {
-	client *minio.Client
-	bucket string
+	client       *minio.Client
+	publicClient *minio.Client
+	bucket       string
 }
 
-func NewStorage(endpoint, accessKey, secretKey, bucket string, useSSL bool) (*Storage, error) {
+func NewStorage(endpoint, publicEndpoint, accessKey, secretKey, bucket string) (*Storage, error) {
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds: credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: useSSL,
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: false,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if publicEndpoint == "" {
+		publicEndpoint = endpoint
+	}
+	publicClient, err := minio.New(publicEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: true,
+		Region: "us-east-1",
 	})
 	if err != nil {
 		return nil, err
@@ -55,13 +67,14 @@ func NewStorage(endpoint, accessKey, secretKey, bucket string, useSSL bool) (*St
 	}
 
 	return &Storage{
-		client: client,
-		bucket: bucket,
+		client:       client,
+		publicClient: publicClient,
+		bucket:       bucket,
 	}, nil
 }
 
 func (s *Storage) PresignedPutURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	u, err := s.client.PresignedPutObject(ctx, s.bucket, objectKey, expiry)
+	u, err := s.publicClient.PresignedPutObject(ctx, s.bucket, objectKey, expiry)
 	if err != nil {
 		return "", err
 	}
@@ -69,7 +82,7 @@ func (s *Storage) PresignedPutURL(ctx context.Context, objectKey string, expiry 
 }
 
 func (s *Storage) PresignedGetURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	u, err := s.client.PresignedGetObject(ctx, s.bucket, objectKey, expiry, url.Values{})
+	u, err := s.publicClient.PresignedGetObject(ctx, s.bucket, objectKey, expiry, url.Values{})
 	if err != nil {
 		return "", err
 	}
@@ -95,7 +108,7 @@ func (s *Storage) ListObjects(ctx context.Context, prefix string) ([]ObjectSumma
 	var result []ObjectSummary
 
 	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
-		Prefix: prefix,
+		Prefix:    prefix,
 		Recursive: true,
 	}) {
 		if obj.Err != nil {

@@ -32,7 +32,6 @@ func NewService(repo RepositoryInterface, jwt jwt.JWTInterface, cfg config.Confi
 		repo: repo,
 		providers: map[string]authprovider.ProviderInterface{
 			"google": authprovider.NewGoogleProvider(cfg.GetGoogleClientID()),
-			"facebook": authprovider.NewFacebookProvider(cfg.GetFacebookAppID(), cfg.GetFacebookAppSecret()),
 		},
 		jwt:   jwt,
 		redis: redis,
@@ -83,7 +82,7 @@ func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string,
 	}, refreshToken, nil
 }
 
-func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, string, error){
+func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, string, error) {
 	userID, err := s.redis.GetDel(
 		context.Background(),
 		"refresh:"+utils.SHA256(refreshToken),
@@ -132,7 +131,7 @@ func (s *Service) issueRefreshToken(userID int64) (string, error) {
 		context.Background(),
 		"refresh:"+utils.SHA256(refreshToken),
 		strconv.FormatInt(userID, 10),
-		30 * 24 * time.Hour,
+		30*24*time.Hour,
 	)
 	if err != nil {
 		return "", err

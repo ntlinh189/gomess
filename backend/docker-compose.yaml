@@ -2,17 +2,16 @@ services:
   mysql:
     image: mysql:8.0
     container_name: gomess-mysql
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: gomess
       MYSQL_USER: gomess
-      MYSQL_PASSWORD: 123456
-    ports:
-      - "3306:3306"
+      MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -20,19 +19,16 @@ services:
   redis:
     image: redis:7
     container_name: gomess-redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
 
   minio:
     image: minio/minio:latest
     container_name: gomess-minio
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: gomess
-      MINIO_ROOT_PASSWORD: gomess12345
-    ports:
-      - "9000:9000"   # API
-      - "9001:9001"   # Console web
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio-data:/data
 
@@ -42,14 +38,14 @@ services:
       dockerfile: Dockerfile
       target: api
     container_name: gomess-api
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      DB_URL: "gomess:${DB_PASSWORD}@tcp(mysql:3306)/gomess?parseTime=true"
       REDIS_ADDR: "redis:6379"
       MINIO_ENDPOINT: "minio:9000"
-    ports:
-      - "8080:8080"
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT}"
     depends_on:
       mysql:
         condition: service_healthy
@@ -58,24 +54,39 @@ services:
       minio:
         condition: service_started
 
-  worker:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+    depends_on:
+      - api
+      - minio
+
+  cronjob:
     build:
       context: .
       dockerfile: Dockerfile
-      target: worker
-    container_name: gomess-worker
+      target: cronjob
+    container_name: gomess-cronjob
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      DB_URL: "gomess:${DB_PASSWORD}@tcp(mysql:3306)/gomess?parseTime=true"
       MINIO_ENDPOINT: "minio:9000"
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT}"
     depends_on:
       mysql:
         condition: service_healthy
       minio:
         condition: service_started
-    restart: unless-stopped
 
 volumes:
   mysql-data:
   minio-data:
+  caddy-data:

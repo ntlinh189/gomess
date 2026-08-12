@@ -9,9 +9,9 @@ import (
 type RepositoryInterface interface {
 	IsFriend(user1ID, user2ID int64) (bool, error)
 	FindPendingRequest(senderID, receiverID int64) (*models.FriendRequest, error)
+	FindRequest(senderID, receiverID int64) (*models.FriendRequest, error)
 	CreateRequest(request *models.FriendRequest) error
 	GetReceivedRequests(userID int64) ([]models.FriendRequest, error)
-	GetSentRequests(userID int64) ([]models.FriendRequest, error)
 	GetRequestByID(id int64) (*models.FriendRequest, error)
 	UpdateRequestStatus(id int64, status string) error
 	CreateFriend(user1ID, user2ID int64) error
@@ -22,6 +22,7 @@ type RepositoryInterface interface {
 	UpdateRequestStatusTx(tx *sql.Tx, id int64, status string) error
 	CreateFriendTx(tx *sql.Tx, user1ID, user2ID int64) error
 	DeleteFriendTx(tx *sql.Tx, user1ID, user2ID int64) error
+	DeleteRequestsBetweenTx(tx *sql.Tx, user1ID, user2ID int64) error
 }
 
 type Repository struct {
@@ -67,7 +68,7 @@ func (r *Repository) FindPendingRequest(senderID, receiverID int64) (*models.Fri
 	var req models.FriendRequest
 	err := row.Scan(
 		&req.ID,
-		&req.SenderID,
+		&req.Sender.ID,
 		&req.ReceiverID,
 		&req.Status,
 		&req.CreatedAt,
@@ -85,12 +86,25 @@ func (r *Repository) FindPendingRequest(senderID, receiverID int64) (*models.Fri
 	return &req, nil
 }
 
+func (r *Repository) FindRequest(senderID, receiverID int64) (*models.FriendRequest, error) {
+	query := `SELECT id, sender_id, receiver_id, status, created_at, updated_at FROM friend_requests WHERE sender_id = ? AND receiver_id = ? LIMIT 1`
+	var req models.FriendRequest
+	err := r.db.GetDB().QueryRow(query, senderID, receiverID).Scan(&req.ID, &req.Sender.ID, &req.ReceiverID, &req.Status, &req.CreatedAt, &req.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
 func (r *Repository) CreateRequest(request *models.FriendRequest) error {
 	query := `
 	INSERT INTO friend_requests (sender_id, receiver_id, status)
 	VALUES (?, ?, ?)
 	`
-	result, err := r.db.GetDB().Exec(query, request.SenderID, request.ReceiverID, request.Status)
+	result, err := r.db.GetDB().Exec(query, request.Sender.ID, request.ReceiverID, request.Status)
 
 	if err != nil {
 		return err
@@ -103,9 +117,12 @@ func (r *Repository) CreateRequest(request *models.FriendRequest) error {
 
 func (r *Repository) GetReceivedRequests(userID int64) ([]models.FriendRequest, error) {
 	query := `
-	SELECT id, sender_id, receiver_id, status, created_at, updated_at
-	FROM friend_requests
-	WHERE receiver_id = ?
+	SELECT fr.id, fr.sender_id, fr.receiver_id, fr.status, fr.created_at, fr.updated_at,
+		u.id, u.provider, u.provider_id, u.account, u.name, u.avatar
+	FROM friend_requests fr
+	JOIN users u ON u.id = fr.sender_id
+	WHERE fr.receiver_id = ? AND fr.status = 'pending'
+	ORDER BY fr.created_at DESC
 	`
 	rows, err := r.db.GetDB().Query(query, userID)
 	if err != nil {
@@ -119,43 +136,17 @@ func (r *Repository) GetReceivedRequests(userID int64) ([]models.FriendRequest, 
 		var req models.FriendRequest
 		err := rows.Scan(
 			&req.ID,
-			&req.SenderID,
+			&req.Sender.ID,
 			&req.ReceiverID,
 			&req.Status,
 			&req.CreatedAt,
 			&req.UpdatedAt,
-		)
-		if err != nil {
-			return nil, err
-		}
-		requests = append(requests, req)
-	}
-	return requests, nil
-}
-
-func (r *Repository) GetSentRequests(userID int64) ([]models.FriendRequest, error) {
-	query := `
-	SELECT id, sender_id, receiver_id, status, created_at, updated_at
-	FROM friend_requests
-	WHERE sender_id = ?
-	`
-	rows, err := r.db.GetDB().Query(query, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	requests := make([]models.FriendRequest, 0)
-
-	for rows.Next() {
-		var req models.FriendRequest
-		err := rows.Scan(
-			&req.ID,
-			&req.SenderID,
-			&req.ReceiverID,
-			&req.Status,
-			&req.CreatedAt,
-			&req.UpdatedAt,
+			&req.Sender.ID,
+			&req.Sender.Provider,
+			&req.Sender.ProviderID,
+			&req.Sender.Account,
+			&req.Sender.Name,
+			&req.Sender.Avatar,
 		)
 		if err != nil {
 			return nil, err
@@ -176,7 +167,7 @@ func (r *Repository) GetRequestByID(id int64) (*models.FriendRequest, error) {
 	var req models.FriendRequest
 	err := row.Scan(
 		&req.ID,
-		&req.SenderID,
+		&req.Sender.ID,
 		&req.ReceiverID,
 		&req.Status,
 		&req.CreatedAt,
@@ -285,7 +276,7 @@ func (r *Repository) CreateFriendTx(tx *sql.Tx, user1ID, user2ID int64) error {
 	if user1ID > user2ID {
 		user1ID, user2ID = user2ID, user1ID
 	}
-	
+
 	query := `
 	INSERT INTO friends(user1_id, user2_id)
 	VALUES(?, ?)
@@ -305,5 +296,16 @@ func (r *Repository) DeleteFriendTx(tx *sql.Tx, user1ID, user2ID int64) error {
 	`
 
 	_, err := tx.Exec(query, user1ID, user2ID)
+	return err
+}
+
+func (r *Repository) DeleteRequestsBetweenTx(tx *sql.Tx, user1ID, user2ID int64) error {
+	query := `
+	DELETE FROM friend_requests
+	WHERE (sender_id = ? AND receiver_id = ?)
+	   OR (sender_id = ? AND receiver_id = ?)
+	`
+
+	_, err := tx.Exec(query, user1ID, user2ID, user2ID, user1ID)
 	return err
 }

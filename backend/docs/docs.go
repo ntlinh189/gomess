@@ -184,33 +184,6 @@ const docTemplate = `{
                 }
             }
         },
-        "/friends/requests/sent": {
-            "get": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Friend"
-                ],
-                "summary": "Get sent friend requests",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "array",
-                            "items": {
-                                "$ref": "#/definitions/dto.FriendRequestResponse"
-                            }
-                        }
-                    }
-                }
-            }
-        },
         "/friends/requests/{id}/accept": {
             "post": {
                 "security": [
@@ -665,8 +638,8 @@ const docTemplate = `{
                 "receiver_id": {
                     "type": "integer"
                 },
-                "sender_id": {
-                    "type": "integer"
+                "sender": {
+                    "$ref": "#/definitions/dto.FriendResponse"
                 },
                 "status": {
                     "type": "string"
@@ -804,6 +777,9 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "provider": {
+                    "type": "string"
+                },
+                "request_status": {
                     "type": "string"
                 }
             }

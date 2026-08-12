@@ -18,7 +18,6 @@ type HandlerInterface interface {
 	DeleteFriend(c *gin.Context)
 	GetFriends(c *gin.Context)
 	GetReceivedRequests(c *gin.Context)
-	GetSentRequests(c *gin.Context)
 }
 
 type Handler struct {
@@ -189,42 +188,16 @@ func (h *Handler) GetReceivedRequests(c *gin.Context) {
 	for _, request := range requests {
 		resp = append(resp, dto.FriendRequestResponse{
 			ID:         request.ID,
-			SenderID:   request.SenderID,
 			ReceiverID: request.ReceiverID,
 			Status:     request.Status,
 			CreatedAt:  request.CreatedAt,
-		})
-	}
-
-	c.JSON(http.StatusOK, resp)
-}
-
-// GetSentRequests godoc
-//
-//	@Summary		Get sent friend requests
-//	@Tags			Friend
-//	@Produce		json
-//	@Security		BearerAuth
-//	@Success		200	{array}	dto.FriendRequestResponse
-//	@Router			/friends/requests/sent [get]
-func (h *Handler) GetSentRequests(c *gin.Context) {
-	userID := c.GetInt64(context.UserIDKey)
-
-	requests, err := h.service.GetSentRequests(userID)
-	if err != nil {
-		logger.FromGin(c).Error("get sent requests error", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
-		return
-	}
-
-	resp := make([]dto.FriendRequestResponse, 0, len(requests))
-	for _, request := range requests {
-		resp = append(resp, dto.FriendRequestResponse{
-			ID:         request.ID,
-			SenderID:   request.SenderID,
-			ReceiverID: request.ReceiverID,
-			Status:     request.Status,
-			CreatedAt:  request.CreatedAt,
+			Sender: dto.FriendResponse{
+				ID:       request.Sender.ID,
+				Provider: request.Sender.Provider,
+				Account:  request.Sender.Account,
+				Name:     request.Sender.Name,
+				Avatar:   request.Sender.Avatar,
+			},
 		})
 	}
 

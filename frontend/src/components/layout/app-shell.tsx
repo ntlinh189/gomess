@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @next/next/no-img-element */
 
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
@@ -8,7 +9,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const { user, signOut } = useAuth();
 
   const avatarUrl = user?.avatar;
-  const initial = (user?.name || user?.email || "U").charAt(0).toUpperCase();
+  const initial = (user?.name || user?.account || "U").charAt(0).toUpperCase();
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#f8fbff,_#eef5ff_40%,_#e6efff)]">
@@ -26,7 +27,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   {initial}
                 </div>
               )}
-              <span className="text-sm font-medium text-slate-700">{user?.name || user?.email || "User"}</span>
+              <span className="text-sm font-medium text-slate-700">{user?.name || user?.account || "User"}</span>
             </div>
             <Button variant="outline" size="sm" onClick={() => signOut()}>
               Logout

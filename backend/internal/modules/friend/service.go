@@ -21,7 +21,6 @@ type ServiceInterface interface {
 	DeleteFriend(userID, friendID int64) error
 	GetFriends(userID int64) ([]models.User, error)
 	GetReceivedRequests(userID int64) ([]models.FriendRequest, error)
-	GetSentRequests(userID int64) ([]models.FriendRequest, error)
 }
 
 type Service struct {
@@ -71,19 +70,27 @@ func (s *Service) SendRequest(senderID, receiverID int64) error {
 		return err
 	}
 	if existing != nil {
-		if existing.SenderID == receiverID {
+		if existing.Sender.ID == receiverID {
 			return s.db.WithTransaction(func(tx *sql.Tx) error {
 				if err := s.repository.UpdateRequestStatusTx(tx, existing.ID, RequestAccepted); err != nil {
 					return err
 				}
-				return s.repository.CreateFriendTx(tx, existing.SenderID, existing.ReceiverID)
+				return s.repository.CreateFriendTx(tx, existing.Sender.ID, existing.ReceiverID)
 			})
 		}
 		return ErrRequestExists
 	}
 
+	previous, err := s.repository.FindRequest(senderID, receiverID)
+	if err != nil {
+		return err
+	}
+	if previous != nil && previous.Status == RequestRejected {
+		return s.repository.UpdateRequestStatus(previous.ID, RequestPending)
+	}
+
 	request := &models.FriendRequest{
-		SenderID:   senderID,
+		Sender:     models.User{ID: senderID},
 		ReceiverID: receiverID,
 		Status:     RequestPending,
 	}
@@ -110,7 +117,7 @@ func (s *Service) AcceptRequest(userID, requestID int64) error {
 		if err := s.repository.UpdateRequestStatusTx(tx, request.ID, RequestAccepted); err != nil {
 			return err
 		}
-		return s.repository.CreateFriendTx(tx, request.SenderID, request.ReceiverID)
+		return s.repository.CreateFriendTx(tx, request.Sender.ID, request.ReceiverID)
 	})
 }
 
@@ -149,7 +156,10 @@ func (s *Service) DeleteFriend(userID, friendID int64) error {
 		if err := s.messageRepo.DeleteConversationTx(tx, userID, friendID); err != nil {
 			return err
 		}
-		return s.repository.DeleteFriendTx(tx, userID, friendID)
+		if err := s.repository.DeleteFriendTx(tx, userID, friendID); err != nil {
+			return err
+		}
+		return s.repository.DeleteRequestsBetweenTx(tx, userID, friendID)
 	})
 }
 
@@ -159,8 +169,4 @@ func (s *Service) GetFriends(userID int64) ([]models.User, error) {
 
 func (s *Service) GetReceivedRequests(userID int64) ([]models.FriendRequest, error) {
 	return s.repository.GetReceivedRequests(userID)
-}
-
-func (s *Service) GetSentRequests(userID int64) ([]models.FriendRequest, error) {
-	return s.repository.GetSentRequests(userID)
 }

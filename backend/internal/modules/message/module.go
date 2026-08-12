@@ -30,11 +30,10 @@ func NewModule(
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
 	messages := rg.Group("/messages")
 
-	protected := messages.Group("")
-	protected.Use(middleware.Auth(m.jwt))
+	messages.Use(middleware.Auth(m.jwt))
 
-	protected.POST("", m.handler.SendMessage)
-	protected.GET("/:friendId", m.handler.GetHistory)
-	protected.DELETE("/:id", m.handler.DeleteForMe)
-	protected.POST("/:id/revoke", m.handler.RevokeMessage)
+	messages.POST("", m.handler.SendMessage)
+	messages.GET("/:friendId", m.handler.GetHistory)
+	messages.DELETE("/:id", m.handler.DeleteForMe)
+	messages.POST("/:id/revoke", m.handler.RevokeMessage)
 }

@@ -14,9 +14,9 @@ type Module struct {
 }
 
 func NewModule(
-	ctx *modules.ModuleContext, 
+	ctx *modules.ModuleContext,
 	repo RepositoryInterface,
-	userRepo UserRepositoryInterface, 
+	userRepo UserRepositoryInterface,
 	messageRepo MessageRepositoryInterface,
 ) *Module {
 	service := NewService(repo, userRepo, messageRepo, ctx.DB)
@@ -28,15 +28,13 @@ func NewModule(
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
 	friends := rg.Group("/friends")
 
-	protected := friends.Group("/")
-	protected.Use(middleware.Auth(m.jwt))
+	friends.Use(middleware.Auth(m.jwt))
 
-	protected.GET("", m.handler.GetFriends)
-	protected.DELETE("/:id", m.handler.DeleteFriend)
+	friends.GET("", m.handler.GetFriends)
+	friends.DELETE("/:id", m.handler.DeleteFriend)
 
-	protected.POST("/requests", m.handler.SendRequest)
-	protected.GET("/requests/received", m.handler.GetReceivedRequests)
-	protected.GET("/requests/sent", m.handler.GetSentRequests)
-	protected.POST("/requests/:id/accept", m.handler.AcceptRequest)
-	protected.POST("/requests/:id/reject", m.handler.RejectRequest)
+	friends.POST("/requests", m.handler.SendRequest)
+	friends.GET("/requests/received", m.handler.GetReceivedRequests)
+	friends.POST("/requests/:id/accept", m.handler.AcceptRequest)
+	friends.POST("/requests/:id/reject", m.handler.RejectRequest)
 }

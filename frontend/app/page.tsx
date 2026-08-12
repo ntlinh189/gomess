@@ -27,5 +27,5 @@ export default function HomePage() {
     return null;
   }
 
-  return <AuthPage mode="login" />;
+  return <AuthPage />;
 }

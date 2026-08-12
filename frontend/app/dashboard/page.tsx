@@ -28,10 +28,8 @@ export default function DashboardPage() {
   }
 
   return (
-    <main className="min-h-screen px-6 py-8">
-      <div className="mx-auto flex max-w-7xl flex-col gap-6">
-        <ChatShell />
-      </div>
+    <main className="h-dvh p-3 md:p-4">
+      <ChatShell />
     </main>
   );
 }

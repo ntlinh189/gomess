@@ -1,35 +1,12 @@
 "use client";
 
-import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { sendMessage } from "@/lib/api";
+import { Paperclip, Send, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
-export function MessageComposer({ conversationId }: { conversationId?: string }) {
-  const [text, setText] = useState("");
-  const queryClient = useQueryClient();
-
-  const mutation = useMutation({
-    mutationFn: ({ conversationId, text }: { conversationId: string; text: string }) => sendMessage(conversationId, text),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
-      setText("");
-    },
-  });
-
-  const handleSubmit = (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!conversationId || !text.trim()) return;
-    mutation.mutate({ conversationId, text: text.trim() });
-  };
-
-  return (
-    <form onSubmit={handleSubmit} className="flex gap-2">
-      <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="Type a message..." className="flex-1 rounded-full border-sky-200" />
-      <Button type="submit" variant="default" className="rounded-full px-4">
-        Send
-      </Button>
-    </form>
-  );
+export function MessageComposer({ disabled, sending, onSend }: { disabled: boolean; sending: boolean; onSend: (content: string, files: File[]) => Promise<void> }) {
+  const [content, setContent] = useState(""); const [files, setFiles] = useState<File[]>([]); const input = useRef<HTMLInputElement>(null); const textarea = useRef<HTMLTextAreaElement>(null);
+  async function send() { if (disabled || sending || (!content.trim() && !files.length)) return; await onSend(content.trim(), files); setContent(""); setFiles([]); }
+  async function submit(event: React.FormEvent) { event.preventDefault(); await send(); }
+  useEffect(() => { if (!textarea.current) return; textarea.current.style.height = "auto"; textarea.current.style.height = `${Math.min(textarea.current.scrollHeight, 160)}px`; }, [content]);
+  return <form onSubmit={submit} className="border-t border-slate-200 bg-white px-4 py-5"><div className="flex items-end gap-3"><input ref={input} type="file" multiple className="hidden" onChange={(event) => setFiles(Array.from(event.target.files ?? []).slice(0, 10))} /><button type="button" aria-label="Attach files" disabled={disabled} onClick={() => input.current?.click()} className="rounded-full p-3 text-slate-500 hover:bg-slate-100"><Paperclip size={21} /></button><textarea ref={textarea} value={content} disabled={disabled} maxLength={2000} rows={1} onChange={(event) => setContent(event.target.value)} onKeyDown={async (event) => { if (event.key === "Enter" && !event.ctrlKey && !event.nativeEvent.isComposing) { event.preventDefault(); await send(); } }} placeholder={disabled ? "Choose a conversation" : "Write a message"} className="max-h-40 min-h-14 flex-1 resize-none rounded-2xl bg-slate-100 px-4 py-3 text-sm leading-5 outline-none ring-sky-500 focus:ring-2" /><button type="submit" disabled={disabled || sending || (!content.trim() && !files.length)} aria-label="Send message" className="rounded-full bg-sky-600 p-3 text-white disabled:opacity-40"><Send size={20} /></button></div>{files.length ? <div className="mt-3 flex flex-wrap gap-2">{files.map((file) => <span key={`${file.name}-${file.lastModified}`} className="flex items-center gap-1 rounded-full bg-sky-50 px-2 py-1 text-xs text-sky-800">{file.name}<button type="button" onClick={() => setFiles((current) => current.filter((item) => item !== file))}><X size={13} /></button></span>)}</div> : null}</form>;
 }

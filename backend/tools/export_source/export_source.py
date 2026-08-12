@@ -44,7 +44,7 @@ for path in sorted(ROOT.rglob("*")):
 
     if (
         path.suffix not in INCLUDE_EXTENSIONS
-        and path.name not in {"Dockerfile", "Makefile"}
+        and path.name not in {"Dockerfile", "Makefile", "Caddyfile"}
     ):
         continue
 

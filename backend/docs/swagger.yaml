@@ -39,8 +39,8 @@ definitions:
         type: integer
       receiver_id:
         type: integer
-      sender_id:
-        type: integer
+      sender:
+        $ref: '#/definitions/dto.FriendResponse'
       status:
         type: string
     type: object
@@ -129,6 +129,8 @@ definitions:
       name:
         type: string
       provider:
+        type: string
+      request_status:
         type: string
     type: object
   dto.SendMessageRequest:
@@ -317,22 +319,6 @@ paths:
       security:
       - BearerAuth: []
       summary: Get received friend requests
-      tags:
-      - Friend
-  /friends/requests/sent:
-    get:
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            items:
-              $ref: '#/definitions/dto.FriendRequestResponse'
-            type: array
-      security:
-      - BearerAuth: []
-      summary: Get sent friend requests
       tags:
       - Friend
   /messages:

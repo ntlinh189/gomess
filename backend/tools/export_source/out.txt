@@ -32,6 +32,78 @@ func main() {
 
 ====================================================================================================
 
+cmd/cronjob/main.go
+package main
+
+import (
+	"context"
+	"gomess/internal/config"
+	"gomess/internal/database"
+	"gomess/internal/jobs"
+	"gomess/internal/logger"
+	"gomess/internal/modules/message"
+	"gomess/pkg/storage"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/robfig/cron/v3"
+)
+
+const cleanupIntervalHours = 6 // Hours
+
+func main() {
+	cfg := config.NewConfig()
+	log := logger.New(cfg.IsProduction())
+
+	db, err := database.NewMySql(cfg)
+	if err != nil {
+		log.Error("cronjob: db connect failed", "error", err)
+		os.Exit(1)
+	}
+
+	storageClient, err := storage.NewStorage(
+		cfg.GetMinioEndpoint(), cfg.GetMinioPublicEndpoint(), cfg.GetMinioAccessKey(),
+		cfg.GetMinioSecretKey(), cfg.GetMinioBucket(),
+	)
+	if err != nil {
+		log.Error("cronjob: storage connect failed", "error", err)
+		os.Exit(1)
+	}
+
+	messageRepo := message.NewRepository(db)
+
+	registeredJobs := []jobs.Job{
+		jobs.NewCleanupAttachmentsJob(messageRepo, storageClient, cleanupIntervalHours),
+	}
+
+	c := cron.New()
+
+	for _, j := range registeredJobs {
+		job := j
+		if _, err := c.AddFunc(job.Schedule(), func() {
+			jobs.Run(context.Background(), log, job)
+		}); err != nil {
+			log.Error("cronjob: register failed", "job", job.Name(), "error", err)
+			os.Exit(1)
+		}
+		log.Info("cronjob: registered", "job", job.Name(), "schedule", job.Schedule())
+	}
+
+	c.Start()
+	log.Info("cronjob: scheduler running")
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Info("cronjob: shutting down")
+	stopCtx := c.Stop()
+	<-stopCtx.Done()
+}
+
+====================================================================================================
+
 cmd/migrate/main.go
 package main
 
@@ -86,120 +158,21 @@ func main() {
 
 ====================================================================================================
 
-cmd/worker/main.go
-package main
-
-import (
-	"context"
-	"gomess/internal/config"
-	"gomess/internal/database"
-	"gomess/internal/logger"
-	"gomess/internal/modules/message"
-	"gomess/pkg/storage"
-	"log/slog"
-	"os"
-	"time"
-)
-
-const gracePeriod = 24 * time.Hour
-
-func main() {
-	cfg := config.NewConfig()
-	log := logger.New(cfg.IsProduction())
-
-	db, err := database.NewMySql(cfg)
-	if err != nil {
-		log.Error("worker: failed to connect database", "error", err)
-		os.Exit(1)
-	}
-
-	storageClient, err := storage.NewStorage(
-		cfg.GetMinioEndpoint(),
-		cfg.GetMinioAccessKey(),
-		cfg.GetMinioSecretKey(),
-		cfg.GetMinioBucket(),
-		cfg.MinioUseSSL(),
-	)
-	if err != nil {
-		log.Error("worker: failed to connect storage", "error", err)
-		os.Exit(1)
-	}
-
-	messageRepo := message.NewRepository(db)
-
-	interval := time.Duration(cfg.WorkerCleanupIntervalHours()) * time.Hour
-	log.Info("worker started", "cleanup_interval", interval.String())
-
-	for {
-		cleanupOrphanedAttachments(context.Background(), log, messageRepo, storageClient)
-		time.Sleep(interval)
-	}
-}
-
-func cleanupOrphanedAttachments(
-	ctx context.Context,
-	log *slog.Logger,
-	repo message.RepositoryInterface,
-	s storage.StorageInterface,
-) {
-	log.Info("cleanup job started")
-
-	referenced, err := repo.GetAllObjectKeys()
-	if err != nil {
-		log.Error("cleanup: failed to list referenced object keys", "error", err)
-		return
-	}
-
-	referencedSet := make(map[string]struct{}, len(referenced))
-	for _, key := range referenced {
-		referencedSet[key] = struct{}{}
-	}
-
-	stored, err := s.ListObjects(ctx, "attachments/")
-	if err != nil {
-		log.Error("cleanup: failed to list storage objects", "error", err)
-		return
-	}
-
-	deleted := 0
-	for _, obj := range stored {
-		if _, ok := referencedSet[obj.Key]; ok {
-			continue
-		}
-
-		if time.Since(obj.LastModified) < gracePeriod {
-			continue
-		}
-
-		if err := s.DeleteObject(ctx, obj.Key); err != nil {
-			log.Error("cleanup: failed to delete orphaned object", "object_key", obj.Key, "error", err)
-			continue
-		}
-
-		deleted++
-	}
-
-	log.Info("cleanup job finished", "checked", len(stored), "deleted", deleted)
-}
-
-====================================================================================================
-
 docker-compose.yaml
 services:
   mysql:
     image: mysql:8.0
     container_name: gomess-mysql
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: gomess
       MYSQL_USER: gomess
-      MYSQL_PASSWORD: 123456
-    ports:
-      - "3306:3306"
+      MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -207,19 +180,16 @@ services:
   redis:
     image: redis:7
     container_name: gomess-redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
 
   minio:
     image: minio/minio:latest
     container_name: gomess-minio
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: gomess
-      MINIO_ROOT_PASSWORD: gomess12345
-    ports:
-      - "9000:9000"   # API
-      - "9001:9001"   # Console web
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio-data:/data
 
@@ -229,14 +199,14 @@ services:
       dockerfile: Dockerfile
       target: api
     container_name: gomess-api
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      DB_URL: "gomess:${DB_PASSWORD}@tcp(mysql:3306)/gomess?parseTime=true"
       REDIS_ADDR: "redis:6379"
       MINIO_ENDPOINT: "minio:9000"
-    ports:
-      - "8080:8080"
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT}"
     depends_on:
       mysql:
         condition: service_healthy
@@ -245,27 +215,42 @@ services:
       minio:
         condition: service_started
 
-  worker:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+    depends_on:
+      - api
+      - minio
+
+  cronjob:
     build:
       context: .
       dockerfile: Dockerfile
-      target: worker
-    container_name: gomess-worker
+      target: cronjob
+    container_name: gomess-cronjob
+    restart: unless-stopped
     env_file:
       - .env
     environment:
-      DB_URL: "gomess:123456@tcp(mysql:3306)/gomess?parseTime=true"
+      DB_URL: "gomess:${DB_PASSWORD}@tcp(mysql:3306)/gomess?parseTime=true"
       MINIO_ENDPOINT: "minio:9000"
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT}"
     depends_on:
       mysql:
         condition: service_healthy
       minio:
         condition: service_started
-    restart: unless-stopped
 
 volumes:
   mysql-data:
   minio-data:
+  caddy-data:
 
 ====================================================================================================
 
@@ -281,15 +266,12 @@ RUN go mod download
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /gomess-api ./cmd/api
-RUN CGO_ENABLED=0 GOOS=linux go build -o /gomess-worker ./cmd/worker
+RUN CGO_ENABLED=0 GOOS=linux go build -o /gomess-cronjob ./cmd/cronjob
 
 # ---- Runtime stage ----
 FROM alpine:3.20 AS api
-
 RUN apk add --no-cache ca-certificates
-
 WORKDIR /app
-
 COPY --from=builder /gomess-api .
 RUN adduser -D -u 1000 appuser
 USER appuser
@@ -297,14 +279,13 @@ EXPOSE 8080
 ENTRYPOINT ["./gomess-api"]
 
 # ---- Runtime: Worker ----
-FROM alpine:3.20 AS worker
-
+FROM alpine:3.20 AS cronjob
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
-COPY --from=builder /gomess-worker .
+COPY --from=builder /gomess-cronjob .
 RUN adduser -D -u 1000 appuser
 USER appuser
-ENTRYPOINT ["./gomess-worker"]
+ENTRYPOINT ["./gomess-cronjob"]
 
 ====================================================================================================
 
@@ -482,33 +463,6 @@ const docTemplate = `{
                     "Friend"
                 ],
                 "summary": "Get received friend requests",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "array",
-                            "items": {
-                                "$ref": "#/definitions/dto.FriendRequestResponse"
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        "/friends/requests/sent": {
-            "get": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Friend"
-                ],
-                "summary": "Get sent friend requests",
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -976,8 +930,8 @@ const docTemplate = `{
                 "receiver_id": {
                     "type": "integer"
                 },
-                "sender_id": {
-                    "type": "integer"
+                "sender": {
+                    "$ref": "#/definitions/dto.FriendResponse"
                 },
                 "status": {
                     "type": "string"
@@ -1115,6 +1069,9 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "provider": {
+                    "type": "string"
+                },
+                "request_status": {
                     "type": "string"
                 }
             }
@@ -1362,33 +1319,6 @@ docs/swagger.json
                 }
             }
         },
-        "/friends/requests/sent": {
-            "get": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Friend"
-                ],
-                "summary": "Get sent friend requests",
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "array",
-                            "items": {
-                                "$ref": "#/definitions/dto.FriendRequestResponse"
-                            }
-                        }
-                    }
-                }
-            }
-        },
         "/friends/requests/{id}/accept": {
             "post": {
                 "security": [
@@ -1843,8 +1773,8 @@ docs/swagger.json
                 "receiver_id": {
                     "type": "integer"
                 },
-                "sender_id": {
-                    "type": "integer"
+                "sender": {
+                    "$ref": "#/definitions/dto.FriendResponse"
                 },
                 "status": {
                     "type": "string"
@@ -1983,6 +1913,9 @@ docs/swagger.json
                 },
                 "provider": {
                     "type": "string"
+                },
+                "request_status": {
+                    "type": "string"
                 }
             }
         },
@@ -2074,8 +2007,8 @@ definitions:
         type: integer
       receiver_id:
         type: integer
-      sender_id:
-        type: integer
+      sender:
+        $ref: '#/definitions/dto.FriendResponse'
       status:
         type: string
     type: object
@@ -2164,6 +2097,8 @@ definitions:
       name:
         type: string
       provider:
+        type: string
+      request_status:
         type: string
     type: object
   dto.SendMessageRequest:
@@ -2352,22 +2287,6 @@ paths:
       security:
       - BearerAuth: []
       summary: Get received friend requests
-      tags:
-      - Friend
-  /friends/requests/sent:
-    get:
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            items:
-              $ref: '#/definitions/dto.FriendRequestResponse'
-            type: array
-      security:
-      - BearerAuth: []
-      summary: Get sent friend requests
       tags:
       - Friend
   /messages:
@@ -2618,9 +2537,7 @@ func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	r.Use(cors.New(cors.Config{
-		AllowOrigins: []string{
-			"http://localhost:3000",
-		},
+		AllowOrigins: cfg.GetClientOrigins(),
 		AllowMethods: []string{
 			"GET",
 			"POST",
@@ -2656,10 +2573,10 @@ func NewApplication(cfg config.ConfigInterface) (*Application, error) {
 
 	storageClient, err := storage.NewStorage(
 		cfg.GetMinioEndpoint(),
+		cfg.GetMinioPublicEndpoint(),
 		cfg.GetMinioAccessKey(),
 		cfg.GetMinioSecretKey(),
 		cfg.GetMinioBucket(),
-		cfg.MinioUseSSL(),
 	)
 	if err != nil {
 		return nil, err
@@ -2731,6 +2648,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -2744,11 +2662,11 @@ type ConfigInterface interface {
 	IsProduction() bool
 	AllowCredentials() bool
 	GetMinioEndpoint() string
+	GetMinioPublicEndpoint() string
 	GetMinioAccessKey() string
 	GetMinioSecretKey() string
 	GetMinioBucket() string
-	MinioUseSSL() bool
-	WorkerCleanupIntervalHours() int
+	GetClientOrigins() []string
 }
 
 type Config struct {
@@ -2760,11 +2678,11 @@ type Config struct {
 	isProduction               bool
 	allowCredentials           bool
 	minioEndpoint              string
+	minioPublicEndpoint        string
 	minioAccessKey             string
 	minioSecretKey             string
 	minioBucket                string
-	minioUseSSL                bool
-	workerCleanupIntervalHours int
+	clientOrigins              []string
 }
 
 func NewConfig() *Config {
@@ -2772,11 +2690,7 @@ func NewConfig() *Config {
 
 	isProduction, _ := strconv.ParseBool(os.Getenv("IS_PRODUCTION"))
 	allowCredentials, _ := strconv.ParseBool(os.Getenv("ALLOW_CREDENTIALS"))
-	minioUseSSL, _ := strconv.ParseBool(os.Getenv("MINIO_USE_SSL"))
-	workerCleanupIntervalHours, err := strconv.Atoi(os.Getenv("WORKER_CLEANUP_INTERVAL_HOURS"))
-	if err != nil || workerCleanupIntervalHours <= 0 {
-		workerCleanupIntervalHours = 6
-	}
+	clientOrigins := parseOrigins(os.Getenv("CLIENT_ORIGINS"))
 
 	return &Config{
 		port:                       os.Getenv("PORT"),
@@ -2787,11 +2701,11 @@ func NewConfig() *Config {
 		isProduction:               isProduction,
 		allowCredentials:           allowCredentials,
 		minioEndpoint:              os.Getenv("MINIO_ENDPOINT"),
+		minioPublicEndpoint:        os.Getenv("MINIO_PUBLIC_ENDPOINT"),
 		minioAccessKey:             os.Getenv("MINIO_ACCESS_KEY"),
 		minioSecretKey:             os.Getenv("MINIO_SECRET_KEY"),
 		minioBucket:                os.Getenv("MINIO_BUCKET"),
-		minioUseSSL:                minioUseSSL,
-		workerCleanupIntervalHours: workerCleanupIntervalHours,
+		clientOrigins: clientOrigins,
 	}
 }
 
@@ -2803,11 +2717,26 @@ func (c *Config) GetRedisAddr() string            { return c.redisAddr }
 func (c *Config) IsProduction() bool              { return c.isProduction }
 func (c *Config) AllowCredentials() bool          { return c.allowCredentials }
 func (c *Config) GetMinioEndpoint() string        { return c.minioEndpoint }
+func (c *Config) GetMinioPublicEndpoint() string  { return c.minioPublicEndpoint }
 func (c *Config) GetMinioAccessKey() string       { return c.minioAccessKey }
 func (c *Config) GetMinioSecretKey() string       { return c.minioSecretKey }
 func (c *Config) GetMinioBucket() string          { return c.minioBucket }
-func (c *Config) MinioUseSSL() bool               { return c.minioUseSSL }
-func (c *Config) WorkerCleanupIntervalHours() int { return c.workerCleanupIntervalHours }
+func (c *Config) GetClientOrigins() []string      { return c.clientOrigins }
+
+func parseOrigins(raw string) []string {
+	if raw == "" {
+		return []string{"http://localhost:3000"}
+	}
+	parts := strings.Split(raw, ",")
+	origins := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			origins = append(origins, p)
+		}
+	}
+	return origins
+}
 
 ====================================================================================================
 
@@ -2819,6 +2748,7 @@ const (
 	RequestIDKey    = "requestID"
 	RequestIDHeader = "X-Request-ID"
 	LoggerKey       = "logger"
+	OriginKey       = "Origin"
 )
 
 ====================================================================================================
@@ -2900,6 +2830,131 @@ func (d *Database) WithTransaction(fn TxFunc) error {
 	}
 
 	return tx.Commit()
+}
+
+====================================================================================================
+
+internal/jobs/cleanup_attachments.go
+package jobs
+
+import (
+	"context"
+	"fmt"
+	"gomess/internal/modules/message"
+	"gomess/pkg/storage"
+	"log/slog"
+	"time"
+)
+
+const attachmentGracePeriod = 24 * time.Hour
+
+type CleanupAttachmentsJob struct {
+	repo     message.RepositoryInterface
+	storage  storage.StorageInterface
+	schedule string
+}
+
+func NewCleanupAttachmentsJob(
+	repo message.RepositoryInterface,
+	s storage.StorageInterface,
+	intervalHours int,
+) *CleanupAttachmentsJob {
+	return &CleanupAttachmentsJob{
+		repo:     repo,
+		storage:  s,
+		schedule: fmt.Sprintf("@every %dh", intervalHours),
+	}
+}
+
+func (j *CleanupAttachmentsJob) Name() string     { return "cleanup-attachments" }
+func (j *CleanupAttachmentsJob) Schedule() string { return j.schedule }
+
+func (j *CleanupAttachmentsJob) Run(ctx context.Context, log *slog.Logger) error {
+	referenced, err := j.repo.GetAllObjectKeys()
+	if err != nil {
+		return fmt.Errorf("list referenced object keys: %w", err)
+	}
+
+	referencedSet := make(map[string]struct{}, len(referenced))
+	for _, key := range referenced {
+		referencedSet[key] = struct{}{}
+	}
+
+	stored, err := j.storage.ListObjects(ctx, "attachments/")
+	if err != nil {
+		return fmt.Errorf("list storage objects: %w", err)
+	}
+
+	deleted := 0
+	failed := 0
+
+	for _, obj := range stored {
+		if _, ok := referencedSet[obj.Key]; ok {
+			continue
+		}
+		if time.Since(obj.LastModified) < attachmentGracePeriod {
+			continue
+		}
+		if err := j.storage.DeleteObject(ctx, obj.Key); err != nil {
+			failed++
+			log.Error("cronjob: failed to delete orphaned object", "key", obj.Key, "error", err)
+			continue
+		}
+		deleted++
+	}
+
+	log.Info("cronjob: cleanup-attachments summary",
+		"scanned", len(stored),
+		"deleted", deleted,
+		"failed", failed,
+	)
+
+	return nil
+}
+
+====================================================================================================
+
+internal/jobs/job.go
+package jobs
+
+import (
+	"context"
+	"log/slog"
+)
+
+type Job interface {
+	Name() string
+	Schedule() string
+	Run(ctx context.Context, log *slog.Logger) error
+}
+
+====================================================================================================
+
+internal/jobs/runner.go
+package jobs
+
+import (
+	"context"
+	"log/slog"
+	"time"
+)
+
+func Run(ctx context.Context, log *slog.Logger, j Job) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("cronjob: panic recovered", "job", j.Name(), "panic", r)
+		}
+	}()
+
+	start := time.Now()
+	log.Info("cronjob: started", "job", j.Name())
+
+	if err := j.Run(ctx, log); err != nil {
+		log.Error("cronjob: failed", "job", j.Name(), "error", err, "duration", time.Since(start).String())
+		return
+	}
+
+	log.Info("cronjob: finished", "job", j.Name(), "duration", time.Since(start).String())
 }
 
 ====================================================================================================
@@ -3214,7 +3269,7 @@ import "time"
 
 type FriendRequest struct {
 	ID         int64
-	SenderID   int64
+	Sender     User
 	ReceiverID int64
 	Status     string
 	CreatedAt  time.Time
@@ -3255,12 +3310,13 @@ internal/models/user.go
 package models
 
 type User struct {
-	ID         int64
-	Provider   string
-	ProviderID string
-	Account    string
-	Name       string
-	Avatar     string
+	ID            int64
+	Provider      string
+	ProviderID    string
+	Account       string
+	Name          string
+	Avatar        string
+	RequestStatus string
 }
 
 ====================================================================================================
@@ -3670,7 +3726,7 @@ func (s *Service) Login(providerName, token string) (*dto.LoginResponse, string,
 	}, refreshToken, nil
 }
 
-func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, string, error){
+func (s *Service) Refresh(refreshToken string) (*dto.RefreshResponse, string, error) {
 	userID, err := s.redis.GetDel(
 		context.Background(),
 		"refresh:"+utils.SHA256(refreshToken),
@@ -3719,7 +3775,7 @@ func (s *Service) issueRefreshToken(userID int64) (string, error) {
 		context.Background(),
 		"refresh:"+utils.SHA256(refreshToken),
 		strconv.FormatInt(userID, 10),
-		30 * 24 * time.Hour,
+		30*24*time.Hour,
 	)
 	if err != nil {
 		return "", err
@@ -3747,11 +3803,11 @@ package dto
 import "time"
 
 type FriendRequestResponse struct {
-	ID         int64     `json:"id"`
-	SenderID   int64     `json:"sender_id"`
-	ReceiverID int64     `json:"receiver_id"`
-	Status     string    `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID         int64          `json:"id"`
+	ReceiverID int64          `json:"receiver_id"`
+	Status     string         `json:"status"`
+	CreatedAt  time.Time      `json:"created_at"`
+	Sender     FriendResponse `json:"sender"`
 }
 
 ====================================================================================================
@@ -3816,7 +3872,6 @@ type HandlerInterface interface {
 	DeleteFriend(c *gin.Context)
 	GetFriends(c *gin.Context)
 	GetReceivedRequests(c *gin.Context)
-	GetSentRequests(c *gin.Context)
 }
 
 type Handler struct {
@@ -3987,42 +4042,16 @@ func (h *Handler) GetReceivedRequests(c *gin.Context) {
 	for _, request := range requests {
 		resp = append(resp, dto.FriendRequestResponse{
 			ID:         request.ID,
-			SenderID:   request.SenderID,
 			ReceiverID: request.ReceiverID,
 			Status:     request.Status,
 			CreatedAt:  request.CreatedAt,
-		})
-	}
-
-	c.JSON(http.StatusOK, resp)
-}
-
-// GetSentRequests godoc
-//
-//	@Summary		Get sent friend requests
-//	@Tags			Friend
-//	@Produce		json
-//	@Security		BearerAuth
-//	@Success		200	{array}	dto.FriendRequestResponse
-//	@Router			/friends/requests/sent [get]
-func (h *Handler) GetSentRequests(c *gin.Context) {
-	userID := c.GetInt64(context.UserIDKey)
-
-	requests, err := h.service.GetSentRequests(userID)
-	if err != nil {
-		logger.FromGin(c).Error("get sent requests error", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
-		return
-	}
-
-	resp := make([]dto.FriendRequestResponse, 0, len(requests))
-	for _, request := range requests {
-		resp = append(resp, dto.FriendRequestResponse{
-			ID:         request.ID,
-			SenderID:   request.SenderID,
-			ReceiverID: request.ReceiverID,
-			Status:     request.Status,
-			CreatedAt:  request.CreatedAt,
+			Sender: dto.FriendResponse{
+				ID:       request.Sender.ID,
+				Provider: request.Sender.Provider,
+				Account:  request.Sender.Account,
+				Name:     request.Sender.Name,
+				Avatar:   request.Sender.Avatar,
+			},
 		})
 	}
 
@@ -4070,9 +4099,9 @@ type Module struct {
 }
 
 func NewModule(
-	ctx *modules.ModuleContext, 
+	ctx *modules.ModuleContext,
 	repo RepositoryInterface,
-	userRepo UserRepositoryInterface, 
+	userRepo UserRepositoryInterface,
 	messageRepo MessageRepositoryInterface,
 ) *Module {
 	service := NewService(repo, userRepo, messageRepo, ctx.DB)
@@ -4084,17 +4113,15 @@ func NewModule(
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
 	friends := rg.Group("/friends")
 
-	protected := friends.Group("/")
-	protected.Use(middleware.Auth(m.jwt))
+	friends.Use(middleware.Auth(m.jwt))
 
-	protected.GET("", m.handler.GetFriends)
-	protected.DELETE("/:id", m.handler.DeleteFriend)
+	friends.GET("", m.handler.GetFriends)
+	friends.DELETE("/:id", m.handler.DeleteFriend)
 
-	protected.POST("/requests", m.handler.SendRequest)
-	protected.GET("/requests/received", m.handler.GetReceivedRequests)
-	protected.GET("/requests/sent", m.handler.GetSentRequests)
-	protected.POST("/requests/:id/accept", m.handler.AcceptRequest)
-	protected.POST("/requests/:id/reject", m.handler.RejectRequest)
+	friends.POST("/requests", m.handler.SendRequest)
+	friends.GET("/requests/received", m.handler.GetReceivedRequests)
+	friends.POST("/requests/:id/accept", m.handler.AcceptRequest)
+	friends.POST("/requests/:id/reject", m.handler.RejectRequest)
 }
 
 ====================================================================================================
@@ -4111,9 +4138,9 @@ import (
 type RepositoryInterface interface {
 	IsFriend(user1ID, user2ID int64) (bool, error)
 	FindPendingRequest(senderID, receiverID int64) (*models.FriendRequest, error)
+	FindRequest(senderID, receiverID int64) (*models.FriendRequest, error)
 	CreateRequest(request *models.FriendRequest) error
 	GetReceivedRequests(userID int64) ([]models.FriendRequest, error)
-	GetSentRequests(userID int64) ([]models.FriendRequest, error)
 	GetRequestByID(id int64) (*models.FriendRequest, error)
 	UpdateRequestStatus(id int64, status string) error
 	CreateFriend(user1ID, user2ID int64) error
@@ -4124,6 +4151,7 @@ type RepositoryInterface interface {
 	UpdateRequestStatusTx(tx *sql.Tx, id int64, status string) error
 	CreateFriendTx(tx *sql.Tx, user1ID, user2ID int64) error
 	DeleteFriendTx(tx *sql.Tx, user1ID, user2ID int64) error
+	DeleteRequestsBetweenTx(tx *sql.Tx, user1ID, user2ID int64) error
 }
 
 type Repository struct {
@@ -4169,7 +4197,7 @@ func (r *Repository) FindPendingRequest(senderID, receiverID int64) (*models.Fri
 	var req models.FriendRequest
 	err := row.Scan(
 		&req.ID,
-		&req.SenderID,
+		&req.Sender.ID,
 		&req.ReceiverID,
 		&req.Status,
 		&req.CreatedAt,
@@ -4187,12 +4215,25 @@ func (r *Repository) FindPendingRequest(senderID, receiverID int64) (*models.Fri
 	return &req, nil
 }
 
+func (r *Repository) FindRequest(senderID, receiverID int64) (*models.FriendRequest, error) {
+	query := `SELECT id, sender_id, receiver_id, status, created_at, updated_at FROM friend_requests WHERE sender_id = ? AND receiver_id = ? LIMIT 1`
+	var req models.FriendRequest
+	err := r.db.GetDB().QueryRow(query, senderID, receiverID).Scan(&req.ID, &req.Sender.ID, &req.ReceiverID, &req.Status, &req.CreatedAt, &req.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
 func (r *Repository) CreateRequest(request *models.FriendRequest) error {
 	query := `
 	INSERT INTO friend_requests (sender_id, receiver_id, status)
 	VALUES (?, ?, ?)
 	`
-	result, err := r.db.GetDB().Exec(query, request.SenderID, request.ReceiverID, request.Status)
+	result, err := r.db.GetDB().Exec(query, request.Sender.ID, request.ReceiverID, request.Status)
 
 	if err != nil {
 		return err
@@ -4205,9 +4246,12 @@ func (r *Repository) CreateRequest(request *models.FriendRequest) error {
 
 func (r *Repository) GetReceivedRequests(userID int64) ([]models.FriendRequest, error) {
 	query := `
-	SELECT id, sender_id, receiver_id, status, created_at, updated_at
-	FROM friend_requests
-	WHERE receiver_id = ?
+	SELECT fr.id, fr.sender_id, fr.receiver_id, fr.status, fr.created_at, fr.updated_at,
+		u.id, u.provider, u.provider_id, u.account, u.name, u.avatar
+	FROM friend_requests fr
+	JOIN users u ON u.id = fr.sender_id
+	WHERE fr.receiver_id = ? AND fr.status = 'pending'
+	ORDER BY fr.created_at DESC
 	`
 	rows, err := r.db.GetDB().Query(query, userID)
 	if err != nil {
@@ -4221,43 +4265,17 @@ func (r *Repository) GetReceivedRequests(userID int64) ([]models.FriendRequest, 
 		var req models.FriendRequest
 		err := rows.Scan(
 			&req.ID,
-			&req.SenderID,
+			&req.Sender.ID,
 			&req.ReceiverID,
 			&req.Status,
 			&req.CreatedAt,
 			&req.UpdatedAt,
-		)
-		if err != nil {
-			return nil, err
-		}
-		requests = append(requests, req)
-	}
-	return requests, nil
-}
-
-func (r *Repository) GetSentRequests(userID int64) ([]models.FriendRequest, error) {
-	query := `
-	SELECT id, sender_id, receiver_id, status, created_at, updated_at
-	FROM friend_requests
-	WHERE sender_id = ?
-	`
-	rows, err := r.db.GetDB().Query(query, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	requests := make([]models.FriendRequest, 0)
-
-	for rows.Next() {
-		var req models.FriendRequest
-		err := rows.Scan(
-			&req.ID,
-			&req.SenderID,
-			&req.ReceiverID,
-			&req.Status,
-			&req.CreatedAt,
-			&req.UpdatedAt,
+			&req.Sender.ID,
+			&req.Sender.Provider,
+			&req.Sender.ProviderID,
+			&req.Sender.Account,
+			&req.Sender.Name,
+			&req.Sender.Avatar,
 		)
 		if err != nil {
 			return nil, err
@@ -4278,7 +4296,7 @@ func (r *Repository) GetRequestByID(id int64) (*models.FriendRequest, error) {
 	var req models.FriendRequest
 	err := row.Scan(
 		&req.ID,
-		&req.SenderID,
+		&req.Sender.ID,
 		&req.ReceiverID,
 		&req.Status,
 		&req.CreatedAt,
@@ -4387,7 +4405,7 @@ func (r *Repository) CreateFriendTx(tx *sql.Tx, user1ID, user2ID int64) error {
 	if user1ID > user2ID {
 		user1ID, user2ID = user2ID, user1ID
 	}
-	
+
 	query := `
 	INSERT INTO friends(user1_id, user2_id)
 	VALUES(?, ?)
@@ -4407,6 +4425,17 @@ func (r *Repository) DeleteFriendTx(tx *sql.Tx, user1ID, user2ID int64) error {
 	`
 
 	_, err := tx.Exec(query, user1ID, user2ID)
+	return err
+}
+
+func (r *Repository) DeleteRequestsBetweenTx(tx *sql.Tx, user1ID, user2ID int64) error {
+	query := `
+	DELETE FROM friend_requests
+	WHERE (sender_id = ? AND receiver_id = ?)
+	   OR (sender_id = ? AND receiver_id = ?)
+	`
+
+	_, err := tx.Exec(query, user1ID, user2ID, user2ID, user1ID)
 	return err
 }
 
@@ -4436,7 +4465,6 @@ type ServiceInterface interface {
 	DeleteFriend(userID, friendID int64) error
 	GetFriends(userID int64) ([]models.User, error)
 	GetReceivedRequests(userID int64) ([]models.FriendRequest, error)
-	GetSentRequests(userID int64) ([]models.FriendRequest, error)
 }
 
 type Service struct {
@@ -4486,19 +4514,27 @@ func (s *Service) SendRequest(senderID, receiverID int64) error {
 		return err
 	}
 	if existing != nil {
-		if existing.SenderID == receiverID {
+		if existing.Sender.ID == receiverID {
 			return s.db.WithTransaction(func(tx *sql.Tx) error {
 				if err := s.repository.UpdateRequestStatusTx(tx, existing.ID, RequestAccepted); err != nil {
 					return err
 				}
-				return s.repository.CreateFriendTx(tx, existing.SenderID, existing.ReceiverID)
+				return s.repository.CreateFriendTx(tx, existing.Sender.ID, existing.ReceiverID)
 			})
 		}
 		return ErrRequestExists
 	}
 
+	previous, err := s.repository.FindRequest(senderID, receiverID)
+	if err != nil {
+		return err
+	}
+	if previous != nil && previous.Status == RequestRejected {
+		return s.repository.UpdateRequestStatus(previous.ID, RequestPending)
+	}
+
 	request := &models.FriendRequest{
-		SenderID:   senderID,
+		Sender:     models.User{ID: senderID},
 		ReceiverID: receiverID,
 		Status:     RequestPending,
 	}
@@ -4525,7 +4561,7 @@ func (s *Service) AcceptRequest(userID, requestID int64) error {
 		if err := s.repository.UpdateRequestStatusTx(tx, request.ID, RequestAccepted); err != nil {
 			return err
 		}
-		return s.repository.CreateFriendTx(tx, request.SenderID, request.ReceiverID)
+		return s.repository.CreateFriendTx(tx, request.Sender.ID, request.ReceiverID)
 	})
 }
 
@@ -4564,7 +4600,10 @@ func (s *Service) DeleteFriend(userID, friendID int64) error {
 		if err := s.messageRepo.DeleteConversationTx(tx, userID, friendID); err != nil {
 			return err
 		}
-		return s.repository.DeleteFriendTx(tx, userID, friendID)
+		if err := s.repository.DeleteFriendTx(tx, userID, friendID); err != nil {
+			return err
+		}
+		return s.repository.DeleteRequestsBetweenTx(tx, userID, friendID)
 	})
 }
 
@@ -4574,10 +4613,6 @@ func (s *Service) GetFriends(userID int64) ([]models.User, error) {
 
 func (s *Service) GetReceivedRequests(userID int64) ([]models.FriendRequest, error) {
 	return s.repository.GetReceivedRequests(userID)
-}
-
-func (s *Service) GetSentRequests(userID int64) ([]models.FriendRequest, error) {
-	return s.repository.GetSentRequests(userID)
 }
 
 ====================================================================================================
@@ -4864,13 +4899,12 @@ func NewModule(
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
 	messages := rg.Group("/messages")
 
-	protected := messages.Group("")
-	protected.Use(middleware.Auth(m.jwt))
+	messages.Use(middleware.Auth(m.jwt))
 
-	protected.POST("", m.handler.SendMessage)
-	protected.GET("/:friendId", m.handler.GetHistory)
-	protected.DELETE("/:id", m.handler.DeleteForMe)
-	protected.POST("/:id/revoke", m.handler.RevokeMessage)
+	messages.POST("", m.handler.SendMessage)
+	messages.GET("/:friendId", m.handler.GetHistory)
+	messages.DELETE("/:id", m.handler.DeleteForMe)
+	messages.POST("/:id/revoke", m.handler.RevokeMessage)
 }
 
 ====================================================================================================
@@ -5099,7 +5133,6 @@ func (r *Repository) CreateAttachmentsTx(tx *sql.Tx, messageID int64, attachment
 	return nil
 }
 
-/// TODO: Delete trash files in file storage. Need job/event in cmd/worker
 func (r *Repository) DeleteConversationTx(tx *sql.Tx, user1ID, user2ID int64) error {
 	query := `
 	DELETE FROM messages
@@ -5613,11 +5646,12 @@ internal/modules/user/dto/search_response.go
 package dto
 
 type SearchResponse struct {
-	ID       int64  `json:"id"`
-	Provider string `json:"provider"`
-	Account  string `json:"account"`
-	Name     string `json:"name"`
-	Avatar   string `json:"avatar"`
+	ID            int64  `json:"id"`
+	Provider      string `json:"provider"`
+	Account       string `json:"account"`
+	Name          string `json:"name"`
+	Avatar        string `json:"avatar"`
+	RequestStatus string `json:"request_status,omitempty"`
 }
 
 ====================================================================================================
@@ -5722,7 +5756,7 @@ func (h *Handler) Search(c *gin.Context) {
 		return
 	}
 
-	users, err := h.service.Search(&req)
+	users, err := h.service.Search(c.GetInt64(context.UserIDKey), &req)
 
 	if err != nil {
 		logger.FromGin(c).Error("search users error", "error", err)
@@ -5794,16 +5828,15 @@ func NewModule(ctx *modules.ModuleContext, repo RepositoryInterface) *Module {
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
 	user := rg.Group("/user")
 
-	protected := user.Group("/")
-	protected.Use(middleware.Auth(m.jwt))
+	user.Use(middleware.Auth(m.jwt))
 
-	protected.GET("/me", m.handler.GetMe)
-	protected.GET(
-		"/search", 
+	user.GET("/me", m.handler.GetMe)
+	user.GET(
+		"/search",
 		middleware.RateLimit(m.redis, "search", 30, time.Minute, middleware.RateLimitByUser),
 		m.handler.Search,
 	)
-	protected.DELETE("/me", m.handler.DeleteMe)
+	user.DELETE("/me", m.handler.DeleteMe)
 }
 
 ====================================================================================================
@@ -5819,7 +5852,7 @@ import (
 
 type RepositoryInterface interface {
 	GetByID(id int64) (*models.User, error)
-	Search(provider string, keyword string, skip int, limit int) ([]*models.User, error)
+	Search(userID int64, provider string, keyword string, skip int, limit int) ([]*models.User, error)
 	ExistsUser(userID int64) (bool, error)
 	DeleteUser(userID int64) error
 }
@@ -5862,16 +5895,19 @@ func (r *Repository) GetByID(id int64) (*models.User, error) {
 	return &user, nil
 }
 
-func (r *Repository) Search(provider string, keyword string, skip int, limit int) ([]*models.User, error) {
+func (r *Repository) Search(userID int64, provider string, keyword string, skip int, limit int) ([]*models.User, error) {
 	query := `
-	SELECT id, provider, provider_id, account, name, avatar
-	FROM users
-	WHERE provider = ? AND LOWER(account) LIKE LOWER(?)
-	ORDER BY name
+	SELECT u.id, u.provider, u.provider_id, u.account, u.name, u.avatar,
+		COALESCE(fr.status, '')
+	FROM users u
+	LEFT JOIN friend_requests fr
+		ON fr.sender_id = ? AND fr.receiver_id = u.id AND fr.status = 'pending'
+	WHERE u.provider = ? AND LOWER(u.account) LIKE LOWER(?)
+	ORDER BY u.name
 	LIMIT ? OFFSET ?
 	`
 
-	rows, err := r.db.GetDB().Query(query, provider, keyword, limit, skip)
+	rows, err := r.db.GetDB().Query(query, userID, provider, keyword, limit, skip)
 
 	if err != nil {
 		return nil, err
@@ -5891,6 +5927,7 @@ func (r *Repository) Search(provider string, keyword string, skip int, limit int
 			&user.Account,
 			&user.Name,
 			&user.Avatar,
+			&user.RequestStatus,
 		)
 
 		if err != nil {
@@ -5939,7 +5976,7 @@ import (
 
 type ServiceInterface interface {
 	GetMe(userID int64) (*dto.GetMeResponse, error)
-	Search(req *dto.SearchRequest) ([]dto.SearchResponse, error)
+	Search(userID int64, req *dto.SearchRequest) ([]dto.SearchResponse, error)
 	DeleteMe(userID int64) error
 }
 
@@ -5969,7 +6006,7 @@ func (s *Service) GetMe(userID int64) (*dto.GetMeResponse, error) {
 	}, nil
 }
 
-func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
+func (s *Service) Search(userID int64, req *dto.SearchRequest) ([]dto.SearchResponse, error) {
 	if req.Skip < 0 {
 		req.Skip = 0
 	}
@@ -5983,6 +6020,7 @@ func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
 	}
 
 	users, err := s.repo.Search(
+		userID,
 		req.Provider,
 		utils.BuildLikePattern(req.Keyword),
 		req.Skip,
@@ -5997,11 +6035,12 @@ func (s *Service) Search(req *dto.SearchRequest) ([]dto.SearchResponse, error) {
 
 	for _, user := range users {
 		resp = append(resp, dto.SearchResponse{
-			ID:       user.ID,
-			Provider: user.Provider,
-			Account:  user.Account,
-			Name:     user.Name,
-			Avatar:   user.Avatar,
+			ID:            user.ID,
+			Provider:      user.Provider,
+			Account:       user.Account,
+			Name:          user.Name,
+			Avatar:        user.Avatar,
+			RequestStatus: user.RequestStatus,
 		})
 	}
 
@@ -6185,29 +6224,38 @@ internal/ws/handler.go
 package ws
 
 import (
+	"gomess/internal/config"
+	"gomess/internal/context"
 	"gomess/internal/logger"
 	"gomess/pkg/jwt"
 	"net/http"
+	"slices"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
-}
-
 type Handler struct {
-	hub *Hub
-	jwt jwt.JWTInterface
+	hub      *Hub
+	jwt      jwt.JWTInterface
+	upgrader websocket.Upgrader
 }
 
-func NewHandler(hub *Hub, jwt jwt.JWTInterface) *Handler {
+func NewHandler(hub *Hub, jwt jwt.JWTInterface, cfg config.ConfigInterface) *Handler {
 	return &Handler{
 		hub: hub,
 		jwt: jwt,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get(context.OriginKey)
+				if origin == "" {
+					return true
+				}
+				return slices.Contains(cfg.GetClientOrigins(), origin)
+			},
+		},
 	}
 }
 
@@ -6224,7 +6272,7 @@ func (h *Handler) Serve(c *gin.Context) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		logger.FromGin(c).Error("websocket upgrade failed", "error", err)
 		return
@@ -6321,11 +6369,13 @@ type Module struct {
 }
 
 func NewModule(ctx *modules.ModuleContext, hub *Hub) *Module {
-	return &Module{handler: NewHandler(hub, ctx.JWT)}
+	return &Module{handler: NewHandler(hub, ctx.JWT, ctx.Cfg)}
 }
 
 func (m *Module) RegisterRoutes(rg *gin.RouterGroup) {
-	rg.GET("/ws", m.handler.Serve)
+	ws := rg.Group("/ws")
+	
+	ws.GET("", m.handler.Serve)
 }
 
 ====================================================================================================
@@ -6341,7 +6391,7 @@ CREATE TABLE users (
     provider VARCHAR(50) NOT NULL,
     provider_id VARCHAR(255) NOT NULL,
 
-    account VARCHAR(255) NOT NULL,
+    account VARCHAR(255),
     name VARCHAR(255),
     avatar TEXT,
 
@@ -6350,8 +6400,7 @@ CREATE TABLE users (
 
     UNIQUE KEY uk_provider_provider_id (
         provider,
-        provider_id,
-        account
+        provider_id
     )
 );
 
@@ -6512,12 +6561,22 @@ CREATE TABLE message_deletions (
 
 ====================================================================================================
 
+pkg/authprovider/errors.go
+package authprovider
+
+import "errors"
+
+var (
+	ErrInvalidToken       = errors.New("Invalid token")
+)
+
+====================================================================================================
+
 pkg/authprovider/google.go
 package authprovider
 
 import (
 	"context"
-	"errors"
 
 	"google.golang.org/api/idtoken"
 )
@@ -6541,7 +6600,7 @@ func (g *GoogleProvider) Verify(token string) (*UserInfo, error) {
 	picture, _ := payload.Claims["picture"].(string)
 
 	if email == "" {
-		return nil, errors.New("Invalid token")
+		return nil, ErrInvalidToken
 	}
 
 	return &UserInfo{
@@ -6683,14 +6742,26 @@ type StorageInterface interface {
 }
 
 type Storage struct {
-	client *minio.Client
-	bucket string
+	client       *minio.Client
+	publicClient *minio.Client
+	bucket       string
 }
 
-func NewStorage(endpoint, accessKey, secretKey, bucket string, useSSL bool) (*Storage, error) {
+func NewStorage(endpoint, publicEndpoint, accessKey, secretKey, bucket string) (*Storage, error) {
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds: credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: useSSL,
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: false,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if publicEndpoint == "" {
+		publicEndpoint = endpoint
+	}
+	publicClient, err := minio.New(publicEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: true,
+		Region: "us-east-1",
 	})
 	if err != nil {
 		return nil, err
@@ -6709,13 +6780,14 @@ func NewStorage(endpoint, accessKey, secretKey, bucket string, useSSL bool) (*St
 	}
 
 	return &Storage{
-		client: client,
-		bucket: bucket,
+		client:       client,
+		publicClient: publicClient,
+		bucket:       bucket,
 	}, nil
 }
 
 func (s *Storage) PresignedPutURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	u, err := s.client.PresignedPutObject(ctx, s.bucket, objectKey, expiry)
+	u, err := s.publicClient.PresignedPutObject(ctx, s.bucket, objectKey, expiry)
 	if err != nil {
 		return "", err
 	}
@@ -6723,7 +6795,7 @@ func (s *Storage) PresignedPutURL(ctx context.Context, objectKey string, expiry 
 }
 
 func (s *Storage) PresignedGetURL(ctx context.Context, objectKey string, expiry time.Duration) (string, error) {
-	u, err := s.client.PresignedGetObject(ctx, s.bucket, objectKey, expiry, url.Values{})
+	u, err := s.publicClient.PresignedGetObject(ctx, s.bucket, objectKey, expiry, url.Values{})
 	if err != nil {
 		return "", err
 	}
@@ -6749,7 +6821,7 @@ func (s *Storage) ListObjects(ctx context.Context, prefix string) ([]ObjectSumma
 	var result []ObjectSummary
 
 	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
-		Prefix: prefix,
+		Prefix:    prefix,
 		Recursive: true,
 	}) {
 		if obj.Err != nil {

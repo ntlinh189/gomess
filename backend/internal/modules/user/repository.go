@@ -8,7 +8,7 @@ import (
 
 type RepositoryInterface interface {
 	GetByID(id int64) (*models.User, error)
-	Search(provider string, keyword string, skip int, limit int) ([]*models.User, error)
+	Search(userID int64, provider string, keyword string, skip int, limit int) ([]*models.User, error)
 	ExistsUser(userID int64) (bool, error)
 	DeleteUser(userID int64) error
 }
@@ -51,16 +51,19 @@ func (r *Repository) GetByID(id int64) (*models.User, error) {
 	return &user, nil
 }
 
-func (r *Repository) Search(provider string, keyword string, skip int, limit int) ([]*models.User, error) {
+func (r *Repository) Search(userID int64, provider string, keyword string, skip int, limit int) ([]*models.User, error) {
 	query := `
-	SELECT id, provider, provider_id, account, name, avatar
-	FROM users
-	WHERE provider = ? AND LOWER(account) LIKE LOWER(?)
-	ORDER BY name
+	SELECT u.id, u.provider, u.provider_id, u.account, u.name, u.avatar,
+		COALESCE(fr.status, '')
+	FROM users u
+	LEFT JOIN friend_requests fr
+		ON fr.sender_id = ? AND fr.receiver_id = u.id AND fr.status = 'pending'
+	WHERE u.provider = ? AND LOWER(u.account) LIKE LOWER(?)
+	ORDER BY u.name
 	LIMIT ? OFFSET ?
 	`
 
-	rows, err := r.db.GetDB().Query(query, provider, keyword, limit, skip)
+	rows, err := r.db.GetDB().Query(query, userID, provider, keyword, limit, skip)
 
 	if err != nil {
 		return nil, err
@@ -80,6 +83,7 @@ func (r *Repository) Search(provider string, keyword string, skip int, limit int
 			&user.Account,
 			&user.Name,
 			&user.Avatar,
+			&user.RequestStatus,
 		)
 
 		if err != nil {

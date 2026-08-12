@@ -86,7 +86,7 @@ func (h *Handler) Search(c *gin.Context) {
 		return
 	}
 
-	users, err := h.service.Search(&req)
+	users, err := h.service.Search(c.GetInt64(context.UserIDKey), &req)
 
 	if err != nil {
 		logger.FromGin(c).Error("search users error", "error", err)
