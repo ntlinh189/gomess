@@ -5,11 +5,13 @@ services:
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: gomess
-      MYSQL_USER: gomess
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
       MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - mysql-data:/var/lib/mysql
+    ports:
+      - "${MYSQL_PORT}:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 5s
@@ -20,6 +22,8 @@ services:
     image: redis:7
     container_name: gomess-redis
     restart: unless-stopped
+    ports:
+      - "${REDIS_PORT}:6379"
 
   minio:
     image: minio/minio:latest
@@ -31,6 +35,9 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio-data:/data
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
 
   api:
     build:
@@ -42,10 +49,12 @@ services:
     env_file:
       - .env
     environment:
-      DB_URL: "gomess:${DB_PASSWORD}@tcp(mysql:3306)/gomess?parseTime=true"
+      DB_URL: "${DB_USER}:${DB_PASSWORD}@tcp(mysql:3306)/${DB_NAME}?parseTime=true"
       REDIS_ADDR: "redis:6379"
       MINIO_ENDPOINT: "minio:9000"
       MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT}"
+    ports:
+      - "${API_PORT}:8080"
     depends_on:
       mysql:
         condition: service_healthy
@@ -53,19 +62,6 @@ services:
         condition: service_started
       minio:
         condition: service_started
-
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy-data:/data
-    depends_on:
-      - api
-      - minio
 
   cronjob:
     build:
@@ -77,7 +73,7 @@ services:
     env_file:
       - .env
     environment:
-      DB_URL: "gomess:${DB_PASSWORD}@tcp(mysql:3306)/gomess?parseTime=true"
+      DB_URL: "${DB_USER}:${DB_PASSWORD}@tcp(mysql:3306)/${DB_NAME}?parseTime=true"
       MINIO_ENDPOINT: "minio:9000"
       MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT}"
     depends_on:
@@ -89,4 +85,3 @@ services:
 volumes:
   mysql-data:
   minio-data:
-  caddy-data:

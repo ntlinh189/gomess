@@ -1,3 +1,14 @@
+Caddyfile
+api.gomess.com {
+    reverse_proxy api:8080
+}
+
+storage.gomess.com {
+    reverse_proxy minio:9000
+}
+
+====================================================================================================
+
 cmd/api/main.go
 // @title						GoMess API
 // @version					1.0
