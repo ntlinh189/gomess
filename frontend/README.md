@@ -7,4 +7,4 @@ npm install
 npm run dev
 ```
 
-The API defaults to `http://localhost:8080` and is automatically addressed under `/api`.
+Browser API requests use the same-origin `/api` path. Next.js proxies them to the local API at `http://localhost:8080/api`.

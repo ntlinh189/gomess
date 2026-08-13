@@ -1,9 +1,6 @@
 import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
 
-const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
-const apiBaseUrl = rawApiUrl.replace(/\/$/, "").endsWith("/api")
-  ? rawApiUrl.replace(/\/$/, "")
-  : `${rawApiUrl.replace(/\/$/, "")}/api`;
+const apiBaseUrl = "/api";
 
 export const api = axios.create({ baseURL: apiBaseUrl, withCredentials: true });
 

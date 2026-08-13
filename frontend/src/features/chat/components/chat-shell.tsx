@@ -33,7 +33,7 @@ export function ChatShell() {
 
   useEffect(() => {
     if (!accessToken) return;
-    const url = new URL(getApiBaseUrl());
+    const url = new URL(getApiBaseUrl(), window.location.origin);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = `${url.pathname.replace(/\/api$/, "")}/api/ws`;
     url.searchParams.set("token", accessToken);
